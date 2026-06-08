@@ -37,14 +37,16 @@ int read_fiemap(int fd, struct fiemap **ret) {
         uint32_t result_extents = 0;
         uint64_t fiemap_start = 0, fiemap_length;
         const size_t n_extra = DIV_ROUND_UP(sizeof(struct fiemap), sizeof(struct fiemap_extent));
+        int r;
 
         assert(fd >= 0);
         assert(ret);
 
         if (fstat(fd, &statinfo) < 0)
                 return log_debug_errno(errno, "Cannot determine file size: %m");
-        if (!S_ISREG(statinfo.st_mode))
-                return -ENOTTY;
+        r = stat_verify_regular(&statinfo);
+        if (r < 0)
+                return r;
         fiemap_length = statinfo.st_size;
 
         /* Zero this out in case we run on a file with no extents */
@@ -56,11 +58,10 @@ int read_fiemap(int fd, struct fiemap **ret) {
         if (!result_fiemap)
                 return -ENOMEM;
 
-        /*  XFS filesystem has incorrect implementation of fiemap ioctl and
-         *  returns extents for only one block-group at a time, so we need
-         *  to handle it manually, starting the next fiemap call from the end
-         *  of the last extent
-         */
+        /* XFS filesystem has incorrect implementation of fiemap ioctl and
+         * returns extents for only one block-group at a time, so we need
+         * to handle it manually, starting the next fiemap call from the end
+         * of the last extent. */
         while (fiemap_start < fiemap_length) {
                 *fiemap = (struct fiemap) {
                         .fm_start = fiemap_start,
@@ -125,7 +126,7 @@ static int read_resume_config(dev_t *ret_devno, uint64_t *ret_offset) {
         assert(ret_devno);
         assert(ret_offset);
 
-        r = proc_cmdline_get_key("noresume", /* flags = */ 0, /* ret_value = */ NULL);
+        r = proc_cmdline_get_key("noresume", /* flags= */ 0, /* ret_value= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to check if 'noresume' kernel command line option is set: %m");
         if (r > 0)
@@ -210,8 +211,9 @@ static int swap_entry_get_resume_config(SwapEntry *swap) {
                 return -errno;
 
         if (!swap->swapfile) {
-                if (!S_ISBLK(st.st_mode))
-                        return -ENOTBLK;
+                r = stat_verify_block(&st);
+                if (r < 0)
+                        return r;
 
                 swap->devno = st.st_rdev;
                 swap->offset = 0;

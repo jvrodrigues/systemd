@@ -1,34 +1,32 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#if HAVE_LIBIDN2
-#  include <idn2.h>
-#elif HAVE_LIBIDN
-#  include <idna.h>
-#  include <stringprep.h>
-#endif
+#include "sd-dlopen.h"
 
 #include "shared-forward.h"
 
-#if HAVE_LIBIDN2 || HAVE_LIBIDN
+#if HAVE_LIBIDN2
+#include <idn2.h>
+
 #include "dlfcn-util.h"
 
-int dlopen_idn(void);
-#else
-static inline int dlopen_idn(void) {
-        return -EOPNOTSUPP;
-}
-#endif
-
-#if HAVE_LIBIDN2
 extern DLSYM_PROTOTYPE(idn2_lookup_u8);
 extern const char *(*sym_idn2_strerror)(int rc) _const_;
 extern DLSYM_PROTOTYPE(idn2_to_unicode_8z8z);
+
+#define IDN_NOTE(priority)                                              \
+        SD_ELF_NOTE_DLOPEN("idn",                                       \
+                           "Support for internationalized domain names", \
+                           priority,                                    \
+                           "libidn2.so.0")
+
+#define DLOPEN_IDN(log_level, priority)                                 \
+        ({                                                              \
+                IDN_NOTE(priority);                                     \
+                dlopen_idn(log_level);                                  \
+        })
+#else
+#define DLOPEN_IDN(log_level, priority) dlopen_idn(log_level)
 #endif
 
-#if HAVE_LIBIDN
-extern DLSYM_PROTOTYPE(idna_to_ascii_4i);
-extern DLSYM_PROTOTYPE(idna_to_unicode_44i);
-extern DLSYM_PROTOTYPE(stringprep_ucs4_to_utf8);
-extern DLSYM_PROTOTYPE(stringprep_utf8_to_ucs4);
-#endif
+int dlopen_idn(int log_level);

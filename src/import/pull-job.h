@@ -3,12 +3,10 @@
 
 #include <curl/curl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 #include "shared-forward.h"
-#include "import-compress.h"
-#include "openssl-util.h"
 
-typedef struct CurlGlue CurlGlue;
 typedef struct PullJob PullJob;
 
 typedef void (*PullJobFinished)(PullJob *job);
@@ -36,6 +34,10 @@ typedef struct PullJob {
         char *url;
 
         void *userdata;
+        free_func_t free_userdata;
+
+        char *description;
+
         PullJobFinished on_finished;
         PullJobOpenDisk on_open_disk;
         PullJobHeader on_header;
@@ -43,7 +45,7 @@ typedef struct PullJob {
         PullJobNotFound on_not_found;
 
         CurlGlue *glue;
-        CURL *curl;
+        CurlSlot *slot;
         struct curl_slist *request_header;
 
         char *etag;
@@ -67,8 +69,9 @@ typedef struct PullJob {
         struct stat disk_stat;
 
         usec_t mtime;
+        char *content_type;
 
-        ImportCompress compress;
+        Compressor *compress;
 
         unsigned progress_percent;
         usec_t start_usec;
@@ -82,6 +85,8 @@ typedef struct PullJob {
 
         bool sync;
         bool force_memory;
+
+        char *authentication_challenge;
 } PullJob;
 
 int pull_job_new(PullJob **ret, const char *url, CurlGlue *glue, void *userdata);
@@ -89,8 +94,12 @@ PullJob* pull_job_unref(PullJob *job);
 
 int pull_job_begin(PullJob *j);
 
-void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result);
-
 void pull_job_close_disk_fd(PullJob *j);
+
+int pull_job_add_request_header(PullJob *j, const char *hdr);
+int pull_job_set_accept(PullJob *j, char * const *l);
+int pull_job_set_bearer_token(PullJob *j, const char *token);
+
+int pull_job_restart(PullJob *j, const char *new_url);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(PullJob*, pull_job_unref);

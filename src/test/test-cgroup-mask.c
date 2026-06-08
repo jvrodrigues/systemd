@@ -51,7 +51,7 @@ TEST_RET(cgroup_mask, .sd_booted = true) {
                 m->defaults.tasks_accounting = false;
         m->defaults.tasks_max = CGROUP_TASKS_MAX_UNSET;
 
-        assert_se(manager_startup(m, NULL, NULL, NULL) >= 0);
+        assert_se(manager_startup(m, NULL, NULL, NULL, NULL) >= 0);
 
         /* Load units and verify hierarchy. */
         ASSERT_OK(manager_load_startable_unit_or_warn(m, "parent.slice", NULL, &parent));
@@ -130,7 +130,7 @@ static void test_cg_mask_to_string_one(CGroupMask mask, const char *t) {
 
 TEST(cg_mask_to_string) {
         test_cg_mask_to_string_one(0, NULL);
-        test_cg_mask_to_string_one(_CGROUP_MASK_ALL, "cpu cpuacct cpuset io blkio memory devices pids bpf-firewall bpf-devices bpf-foreign bpf-socket-bind bpf-restrict-network-interfaces");
+        test_cg_mask_to_string_one(_CGROUP_MASK_ALL, "cpu cpuacct cpuset io blkio memory devices pids bpf-firewall bpf-devices bpf-foreign bpf-socket-bind bpf-restrict-network-interfaces bpf-bind-network-interface");
         test_cg_mask_to_string_one(CGROUP_MASK_CPU, "cpu");
         test_cg_mask_to_string_one(CGROUP_MASK_CPUACCT, "cpuacct");
         test_cg_mask_to_string_one(CGROUP_MASK_CPUSET, "cpuset");

@@ -36,6 +36,7 @@ systemd_resolved_extract_sources = files(
         'resolved-mdns.c',
         'resolved-resolv-conf.c',
         'resolved-socket-graveyard.c',
+        'resolved-static-records.c',
         'resolved-util.c',
         'resolved-varlink.c',
 )
@@ -68,9 +69,8 @@ endif
 
 resolve_common_template = {
         'dependencies' : [
-                libopenssl,
-                libm,
-                threads,
+                libidn2_cflags,
+                libopenssl_cflags,
         ],
 }
 
@@ -83,7 +83,6 @@ executables += [
                 'dbus' : true,
                 'sources' : systemd_resolved_sources,
                 'extract' : systemd_resolved_extract_sources,
-                'include_directories' : [libexec_template['include_directories'], include_directories('.')],
         },
         executable_template + resolve_common_template + {
                 'name' : 'resolvectl',
@@ -92,9 +91,6 @@ executables += [
                         'resolvconf-compat.c',
                         'resolvectl.c',
                 ),
-                'dependencies' : resolve_common_template['dependencies'] + [
-                        libidn,
-                ],
                 'objects' : ['systemd-resolved'],
         },
         resolve_test_template + {

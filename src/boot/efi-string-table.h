@@ -2,10 +2,9 @@
 #pragma once
 
 #include "efi-string.h"
-#include "macro-fundamental.h"
+#include "macro.h"
 
 #define _DEFINE_STRING_TABLE_LOOKUP_TO_STRING(name,type,scope)                          \
-        /* NOLINTNEXTLINE (readability-inconsistent-declaration-parameter-name) */      \
         scope const char* name##_to_string(type i) {                                    \
                 assert(i >= 0 && i < (type) ELEMENTSOF(name##_table));                  \
                 return name##_table[i];                                                 \

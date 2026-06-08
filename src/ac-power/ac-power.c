@@ -1,14 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
-#include "alloc-util.h"
-#include "ansi-color.h"
 #include "battery-util.h"
 #include "build.h"
+#include "format-table.h"
+#include "help-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "pretty-print.h"
+#include "options.h"
 #include "string-util.h"
 
 static bool arg_verbose = false;
@@ -19,78 +17,51 @@ static enum {
 } arg_action = ACTION_AC_POWER;
 
 static int help(void) {
-        _cleanup_free_ char *link = NULL;
         int r;
 
-        r = terminal_urlify_man("systemd-ac-power", "1", &link);
+        _cleanup_(table_unrefp) Table *options = NULL;
+        r = option_parser_get_help_table(&options);
         if (r < 0)
-                return log_oom();
+                return r;
 
-        printf("%1$s [OPTION]\n"
-               "\n%2$sReport whether we are connected to an external power source.%3$s\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "  -v --verbose          Show state as text\n"
-               "     --low              Check if battery is discharging and low\n"
-               "\nSee the %4$s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
+        help_cmdline("[OPTIONS...]");
+        help_abstract("Report whether we are connected to an external power source.");
 
+        help_section("Options");
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
+
+        help_man_page_reference("systemd-ac-power", "1");
         return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
 
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_LOW,
-        };
-
-        static const struct option options[] = {
-                { "help",    no_argument, NULL, 'h'         },
-                { "version", no_argument, NULL, ARG_VERSION },
-                { "verbose", no_argument, NULL, 'v'         },
-                { "low",     no_argument, NULL, ARG_LOW     },
-                {}
-        };
-
-        int c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hv", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return help();
 
-                case 'h':
-                        help();
-                        return 0;
-
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'v':
+                OPTION('v', "verbose", NULL, "Show state as text"):
                         arg_verbose = true;
                         break;
 
-                case ARG_LOW:
+                OPTION_LONG("low", NULL, "Check if battery is discharging and low"):
                         arg_action = ACTION_LOW;
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
-        if (optind < argc)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "%s takes no arguments.",
-                                       program_invocation_short_name);
+        if (option_parser_get_n_args(&opts) > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
         return 1;
 }

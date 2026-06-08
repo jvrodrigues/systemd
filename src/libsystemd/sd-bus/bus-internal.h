@@ -8,6 +8,7 @@
 #include "bus-match.h"
 #include "constants.h"
 #include "list.h"
+#include "pidref.h"
 #include "runtime-scope.h"
 #include "socket-util.h"
 
@@ -15,6 +16,13 @@
  * that way we become independent of /var being mounted */
 #define DEFAULT_SYSTEM_BUS_ADDRESS "unix:path=/run/dbus/system_bus_socket"
 #define DEFAULT_USER_BUS_ADDRESS_FMT "unix:path=%s/bus"
+
+/* Private vtable flag: dispatch the method handler on its own fiber, so it can use suspending
+ * primitives (sd_bus_call() on a fiber, sd_fiber_sleep(), loop_read_suspend(), ...) without
+ * blocking the event loop for other connections or method calls. Kept out of the public
+ * sd-bus-vtable.h so the fiber runtime stays an implementation detail of systemd. The bit value is
+ * reserved in sd-bus-vtable.h to make sure it never collides with a future public flag. */
+#define SD_BUS_VTABLE_METHOD_FIBER (UINT64_C(1) << 10)
 
 typedef struct BusReplyCallback {
         sd_bus_message_handler_t callback;
@@ -221,6 +229,12 @@ typedef struct sd_bus {
         Set *vtable_methods;
         Set *vtable_properties;
 
+        /* Futures for outstanding SD_BUS_VTABLE_METHOD_FIBER dispatches. Entries are added as the
+         * dispatcher spawns each fiber and removed when the fiber resolves. On bus_enter_closing()
+         * we cancel everything in here and then wait in process_closing() until the set drains,
+         * before tearing down the rest of the bus. */
+        Set *fiber_futures;
+
         union sockaddr_union sockaddr;
         socklen_t sockaddr_size;
 
@@ -254,8 +268,10 @@ typedef struct sd_bus {
 
         uint64_t creds_mask;
 
+        /* Accumulated fds from multiple recvmsg() calls for a single D-Bus message */
         int *fds;
         size_t n_fds;
+        bool got_ctrunc; /* MSG_CTRUNC was seen during any recvmsg() */
 
         char *exec_path;
         char **exec_argv;
@@ -271,7 +287,7 @@ typedef struct sd_bus {
         unsigned n_memfd_cache;
 
         uint64_t origin_id;
-        pid_t busexec_pid;
+        PidRef busexec_pidref;
 
         unsigned iteration_counter;
 

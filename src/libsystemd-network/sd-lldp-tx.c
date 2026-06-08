@@ -157,6 +157,7 @@ int sd_lldp_tx_set_multicast_mode(sd_lldp_tx *lldp_tx, sd_lldp_multicast_mode_t 
 
 int sd_lldp_tx_set_hwaddr(sd_lldp_tx *lldp_tx, const struct ether_addr *hwaddr) {
         assert_return(lldp_tx, -EINVAL);
+        assert_return(hwaddr, -EINVAL);
         assert_return(!ether_addr_is_null(hwaddr), -EINVAL);
 
         lldp_tx->hwaddr = *hwaddr;
@@ -365,7 +366,7 @@ static int lldp_tx_create_packet(sd_lldp_tx *lldp_tx, size_t *ret_packet_size, u
         assert(ret_packet);
 
         /* If ifname is not set yet, set ifname from ifindex. */
-        r = sd_lldp_tx_get_ifname(lldp_tx, /* ret = */ NULL);
+        r = sd_lldp_tx_get_ifname(lldp_tx, /* ret= */ NULL);
         if (r < 0)
                 return r;
 

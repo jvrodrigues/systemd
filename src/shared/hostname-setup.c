@@ -284,8 +284,8 @@ int hostname_substitute_wildcards(char *name) {
 
                         struct siphash state;
                         siphash24_init(&state, key.bytes);
-                        siphash24_compress(&mid, sizeof(mid), &state);
-                        siphash24_compress(&counter, sizeof(counter), &state); /* counter mode */
+                        siphash24_compress_typesafe(mid, &state);
+                        siphash24_compress_typesafe(counter, &state); /* counter mode */
                         h = siphash24_finalize(&state);
                         left_bits = sizeof(h) * 8;
                         counter++;
@@ -404,7 +404,7 @@ int pidref_gethostname_full(PidRef *pidref, GetHostnameFlags flags, char **ret) 
                 return r;
 
         char buf[LINUX_HOST_NAME_MAX+1];
-        ssize_t n = loop_read(result_pipe[0], buf, sizeof(buf), /* do_poll = */ false);
+        ssize_t n = loop_read(result_pipe[0], buf, sizeof(buf), /* do_poll= */ false);
         if (n < 0)
                 return n;
         if (n == 0 || buf[n - 1] != '\0')

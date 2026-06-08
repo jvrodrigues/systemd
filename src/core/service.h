@@ -8,6 +8,18 @@
 #include "pidref.h"
 #include "unit.h"
 
+/* FDNAME used to push the JSON mapping memfd that pairs upstream-propagated fdstore indices with
+ * (unit-id, original fdname) tuples. The receiving manager looks for this fdname in LISTEN_FDNAMES
+ * to find the mapping document. */
+#define SERVICE_FDSTORE_MAPPING_FDNAME "systemd-fdstore-mapping"
+
+/* Prefix for the upstream FDNAME used when forwarding individual fd-store entries to a parent
+ * supervisor: the entries are exposed as "sub-fdstore-<index>" so the supervisor's own fd-store
+ * namespace doesn't collide with names a downstream service manager assigns. The trailing index
+ * is matched up with an entry in the SERVICE_FDSTORE_MAPPING_FDNAME memfd to recover the original
+ * (unit, fdname) pair. */
+#define SERVICE_FDSTORE_SUB_FDNAME_PREFIX "sub-fdstore-"
+
 typedef enum ServiceRestart {
         SERVICE_RESTART_NO,
         SERVICE_RESTART_ON_SUCCESS,
@@ -96,6 +108,15 @@ typedef enum ServiceRestartMode {
         _SERVICE_RESTART_MODE_INVALID = -EINVAL,
 } ServiceRestartMode;
 
+typedef enum ServiceRefreshOnReload {
+        SERVICE_RELOAD_EXTENSIONS  = 1 << 0,
+        SERVICE_RELOAD_CREDENTIALS = 1 << 1,
+        _SERVICE_REFRESH_ON_RELOAD_ALL = (1 << 2) - 1,
+        _SERVICE_REFRESH_ON_RELOAD_INVALID = -EINVAL,
+} ServiceRefreshOnReload;
+
+#define SERVICE_REFRESH_ON_RELOAD_DEFAULT SERVICE_RELOAD_EXTENSIONS
+
 typedef struct ServiceFDStore {
         Service *service;
 
@@ -103,6 +124,10 @@ typedef struct ServiceFDStore {
         char *fdname;
         sd_event_source *event_source;
         bool do_poll;
+        /* If non-zero, this fd was forwarded to the NOTIFY_SOCKET supervisor via FDSTORE=1, with the
+         * stringified value of this index as its FDNAME. The originating unit-id and original fdname
+         * are recorded in a JSON mapping memfd that is also pushed upstream. */
+        uint64_t index;
 
         LIST_FIELDS(struct ServiceFDStore, fd_store);
 } ServiceFDStore;
@@ -237,6 +262,10 @@ typedef struct Service {
         int reload_signal;
         usec_t reload_begin_usec;
 
+        bool refresh_on_reload_set;
+        ServiceRefreshOnReload refresh_on_reload_flags;
+        ServiceRefreshOnReload refreshed_mask;
+
         OOMPolicy oom_policy;
 
         char *usb_function_descriptors;
@@ -266,36 +295,37 @@ extern const UnitVTable service_vtable;
 int service_set_socket_fd(Service *s, int fd, struct Socket *socket, struct SocketPeer *peer, bool selinux_context_net);
 void service_release_socket_fd(Service *s);
 
-usec_t service_restart_usec_next(Service *s);
+int service_add_fd_store(Service *s, int fd_in, const char *name, bool do_poll, bool propagate_upstream);
+
+int service_propagate_fd_store_mapping_upstream(Manager *m);
+
+ServiceExtraFD* service_extra_fd_free(ServiceExtraFD *fd);
+
+usec_t service_restart_usec_next(const Service *s) _pure_;
 
 int service_determine_exec_selinux_label(Service *s, char **ret);
 
-const char* service_restart_to_string(ServiceRestart i) _const_;
-ServiceRestart service_restart_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_restart, ServiceRestart);
 
-const char* service_restart_mode_to_string(ServiceRestartMode i) _const_;
-ServiceRestartMode service_restart_mode_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_restart_mode, ServiceRestartMode);
 
-const char* service_type_to_string(ServiceType i) _const_;
-ServiceType service_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_type, ServiceType);
 
-const char* service_exit_type_to_string(ServiceExitType i) _const_;
-ServiceExitType service_exit_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_exit_type, ServiceExitType);
 
-const char* service_exec_command_to_string(ServiceExecCommand i) _const_;
-ServiceExecCommand service_exec_command_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_exec_command, ServiceExecCommand);
 
-const char* service_exec_ex_command_to_string(ServiceExecCommand i) _const_;
-ServiceExecCommand service_exec_ex_command_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_exec_ex_command, ServiceExecCommand);
 
-const char* notify_state_to_string(NotifyState i) _const_;
-NotifyState notify_state_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(notify_state, NotifyState);
 
-const char* service_result_to_string(ServiceResult i) _const_;
-ServiceResult service_result_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_result, ServiceResult);
 
-const char* service_timeout_failure_mode_to_string(ServiceTimeoutFailureMode i) _const_;
-ServiceTimeoutFailureMode service_timeout_failure_mode_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(service_timeout_failure_mode, ServiceTimeoutFailureMode);
+
+ServiceRefreshOnReload service_refresh_on_reload_flag_from_string(const char *s) _pure_;
+int service_refresh_on_reload_from_string_many(const char *s, ServiceRefreshOnReload *ret);
+int service_refresh_on_reload_to_strv(ServiceRefreshOnReload flags, char ***ret);
 
 DEFINE_CAST(SERVICE, Service);
 

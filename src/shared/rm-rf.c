@@ -37,8 +37,9 @@ static int patch_dirfd_mode(
 
         if (fstat(dfd, &st) < 0)
                 return -errno;
-        if (!S_ISDIR(st.st_mode))
-                return -ENOTDIR;
+        r = stat_verify_directory(&st);
+        if (r < 0)
+                return r;
 
         if (FLAGS_SET(st.st_mode, 0700)) { /* Already set? */
                 if (refuse_already_set)
@@ -72,7 +73,7 @@ int unlinkat_harder(int dfd, const char *filename, int unlink_flags, RemoveFlags
         if (errno != EACCES || !FLAGS_SET(remove_flags, REMOVE_CHMOD))
                 return -errno;
 
-        r = patch_dirfd_mode(dfd, /* refuse_already_set = */ true, &old_mode);
+        r = patch_dirfd_mode(dfd, /* refuse_already_set= */ true, &old_mode);
         if (r < 0)
                 return r;
 
@@ -107,7 +108,7 @@ int fstatat_harder(int dfd,
         if (errno != EACCES || !FLAGS_SET(remove_flags, REMOVE_CHMOD))
                 return -errno;
 
-        r = patch_dirfd_mode(dfd, /* refuse_already_set = */ true, &old_mode);
+        r = patch_dirfd_mode(dfd, /* refuse_already_set= */ true, &old_mode);
         if (r < 0)
                 return r;
 
@@ -159,7 +160,7 @@ static int openat_harder(int dfd, const char *path, int open_flags, RemoveFlags 
                 return pfd;
 
         if (FLAGS_SET(remove_flags, REMOVE_CHMOD)) {
-                r = patch_dirfd_mode(pfd, /* refuse_already_set = */ false, &old_mode);
+                r = patch_dirfd_mode(pfd, /* refuse_already_set= */ false, &old_mode);
                 if (r < 0)
                         return r;
 
@@ -268,6 +269,8 @@ typedef struct TodoEntry {
 } TodoEntry;
 
 static void free_todo_entries(TodoEntry **todos) {
+        assert(todos);
+
         for (TodoEntry *x = *todos; x && x->dir; x++) {
                 closedir(x->dir);
                 free(x->dirname);

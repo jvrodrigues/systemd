@@ -35,11 +35,15 @@ All tools:
   no-ops. If that's what's explicitly desired, you might consider setting
   `$SYSTEMD_OFFLINE=1`.
 
+* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
+  This is useful for debugging and testing initrd-only programs in the main
+  system.
+
 * `$SYSTEMD_FIRST_BOOT=0|1` — if set, assume "first boot" condition to be false
   or true, instead of checking the flag file created by PID 1.
 
-* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
-  will print latency information at runtime.
+* `$SYSTEMD_INVOKED_AS=name` — override argv[0] for detection of a multicall
+  binary. E.g. `SYSTEMD_INVOKED_AS=systemd-udevd build/udevadm`.
 
 * `$SYSTEMD_PROC_CMDLINE` — if set, the contents are used as the kernel command
   line instead of the actual one in `/proc/cmdline`. This is useful for
@@ -76,9 +80,8 @@ All tools:
   (relevant in particular for the system manager and `systemd-hostnamed`).
   Must be a valid hostname (either a single label or a FQDN).
 
-* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
-  This is useful for debugging and testing initrd-only programs in the main
-  system.
+* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
+  will print latency information at runtime.
 
 * `$SYSTEMD_BUS_TIMEOUT=SECS` — specifies the maximum time to wait for method call
   completion. If no time unit is specified, assumes seconds. The usual other units
@@ -137,8 +140,6 @@ All tools:
 
 * `$SYSTEMCTL_INSTALL_CLIENT_SIDE=1` — if set, enable or disable unit files on
   the client side, instead of asking PID 1 to do this.
-
-* `$SYSTEMCTL_SKIP_SYSV=1` — if set, do not call SysV compatibility hooks.
 
 * `$SYSTEMCTL_SKIP_AUTO_KEXEC=1` — if set, do not automatically kexec instead of
   reboot when a new kernel has been loaded.
@@ -291,6 +292,9 @@ All tools:
   user/group records for dynamically registered service users (i.e. users
   registered through `DynamicUser=1`).
 
+* `$SYSTEMD_NSS_LOG_LEVEL=<level>` — If set, sets the log level for `nss-systemd`
+  and other NSS plugins specifically. Takes priority over `$SYSTEMD_LOG_LEVEL`.
+
 `systemd-timedated`:
 
 * `$SYSTEMD_TIMEDATED_NTP_SERVICES=…` — colon-separated list of unit names of
@@ -381,11 +385,15 @@ All tools:
 
 * `$SYSTEMD_KEYMAP_DIRECTORIES=` — takes a colon (`:`) separated list of keymap
   directories. The directories must be absolute and normalized. If unset, the
-  default keymap directories (/usr/share/keymaps/, /usr/share/kbd/keymaps/, and
-  /usr/lib/kbd/keymaps/) will be used.
+  default keymap directories (`/usr/share/keymaps/`, `/usr/share/kbd/keymaps/`,
+  and `/usr/lib/kbd/keymaps/`) will be used.
 
-* `$SYSTEMD_XKB_DIRECTORY=` — The directory must be absolute and normalized.
-  If unset, the default XKB directory (/usr/share/X11/xkb) will be used.
+* `$SYSTEMD_XKB_DIRECTORY=` — The directory must be absolute and normalized. If
+  unset, the default XKB directory (`/usr/share/X11/xkb/`) will be used.
+
+* `$SYSTEMD_LOCALE_DIRECTORY=` — The directory must be absolute and normalized.
+  If unset, the default locale directory of the C library (`/usr/lib/locale/`
+  for glibc and `/usr/share/i18n/locales/musl/` for musl) will be used.
 
 `systemd-resolved`:
 
@@ -448,14 +456,6 @@ All tools:
   skipped. This can be useful if `systemd-sysusers` is invoked unconditionally
   as a child process by another tool, such as package managers running it in a
   postinstall script.
-
-`systemd-sysv-generator`:
-
-* `$SYSTEMD_SYSVINIT_PATH` — Controls where `systemd-sysv-generator` looks for
-  SysV init scripts.
-
-* `$SYSTEMD_SYSVRCND_PATH` — Controls where `systemd-sysv-generator` looks for
-  SysV init script runlevel link farms.
 
 systemd tests:
 
@@ -678,6 +678,15 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   specified algorithm takes an effect immediately, you need to explicitly run
   `journalctl --rotate`.
 
+* `$SYSTEMD_JOURNAL_FD_SIZE_MAX` – Takes a size with the usual suffixes (K, M, ...) in
+  string format. Overrides the default maximum allowed size for a file-descriptor
+  based input record to be stored in the journal.
+
+* `$SYSTEMD_JOURNAL_REMOTE_CONFIG_FILE` – path to a configuration file for
+  `systemd-journal-remote`. When set, the specified file is used instead of the
+  default configuration file and drop-in directories. If set to the empty string
+  or `/dev/null`, configuration file parsing is skipped entirely.
+
 * `$SYSTEMD_CATALOG` – path to the compiled catalog database file to use for
   `journalctl -x`, `journalctl --update-catalog`, `journalctl --list-catalog`
   and related calls.
@@ -763,6 +772,9 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
   would listen on. If set to "-" the tool will turn stdin/stdout into a Varlink
   connection.
 
+* `$SYSTEMD_VARLINK_BRIDGES_DIR` – overrides the default `$LIBEXEC/varlink-bridges/`
+  path when looking up custom scheme bridge helper binaries.
+
 `systemd-mountfsd`:
 
 * `$SYSTEMD_MOUNTFSD_TRUSTED_DIRECTORIES` – takes a boolean argument. If true
@@ -846,3 +858,10 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
   overall number of threads used to load modules by `systemd-modules-load`.
   If unset, the default number of threads is equal to the number of online CPUs,
   with a maximum of 16. If set to `0`, multi-threaded loading is disabled.
+
+`systemd-sysupdate`:
+
+* `$SYSTEMD_SYSUPDATE_VERIFY_FRESHNESS` – takes a boolean. If false the
+  'freshness' check via `BEST-BEFORE-YYYY-MM-DD` files in `SHA256SUMS` manifest
+  files is disabled, and updating from outdated manifests will not result in an
+  error.

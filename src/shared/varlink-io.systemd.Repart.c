@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "sd-varlink-idl.h"
-
 #include "varlink-io.systemd.Repart.h"
 
 static SD_VARLINK_DEFINE_ENUM_TYPE(
@@ -43,7 +41,7 @@ static SD_VARLINK_DEFINE_METHOD_FULL(
                 SD_VARLINK_FIELD_COMMENT("The seed value to derive partition and file system UUIDs from"),
                 SD_VARLINK_DEFINE_INPUT(seed, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("Path to directory containing definition files."),
-                SD_VARLINK_DEFINE_INPUT(definitions, SD_VARLINK_STRING, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_INPUT(definitions, SD_VARLINK_STRING, SD_VARLINK_ARRAY|SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("If true, automatically defer creation of all partitions whose label is \"empty\"."),
                 SD_VARLINK_DEFINE_INPUT(deferPartitionsEmpty, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("If true, automatically defer creation of all partitions which are marked for factory reset."),
@@ -59,8 +57,9 @@ static SD_VARLINK_DEFINE_METHOD_FULL(
                 SD_VARLINK_FIELD_COMMENT("If used with the 'more' flag, a progress percentrage (specific to the work done for the specified phase+object is sent in progress updates."),
                 SD_VARLINK_DEFINE_OUTPUT(progress, SD_VARLINK_INT, SD_VARLINK_NULLABLE));
 
-static SD_VARLINK_DEFINE_METHOD(
+static SD_VARLINK_DEFINE_METHOD_FULL(
                 ListCandidateDevices,
+                SD_VARLINK_REQUIRES_MORE,
                 SD_VARLINK_FIELD_COMMENT("Control whether to include the root disk of the currently booted OS in the list. Defaults to false, i.e. the root disk is included."),
                 SD_VARLINK_DEFINE_INPUT(ignoreRoot, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("Control whether to include block devices with zero size in the list, i.e. typically block devices without any inserted medium. Defaults to false, i.e. empty block devices are included."),

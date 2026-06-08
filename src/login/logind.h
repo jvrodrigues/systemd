@@ -153,13 +153,13 @@ int manager_add_user_by_uid(Manager *m, uid_t uid, User **ret_user);
 int manager_add_inhibitor(Manager *m, const char* id, Inhibitor **ret_inhibitor);
 
 int manager_process_seat_device(Manager *m, sd_device *d);
-int manager_process_button_device(Manager *m, sd_device *d);
+int manager_process_button_device(Manager *m, sd_device *d, Button **ret_button);
 
 int manager_spawn_autovt(Manager *m, unsigned vtnr);
 
 bool manager_shall_kill(Manager *m, const char *user);
 
-int manager_get_idle_hint(Manager *m, dual_timestamp *t);
+bool manager_get_idle_hint(Manager *m, dual_timestamp *ret_timestamp);
 
 int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret);
 int manager_get_session_by_pidref(Manager *m, const PidRef *pid, Session **ret);

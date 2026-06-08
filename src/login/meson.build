@@ -21,6 +21,7 @@ systemd_logind_extract_sources = files(
         'logind-session-dbus.c',
         'logind-session-device.c',
         'logind-session.c',
+        'logind-shutdown.c',
         'logind-user-dbus.c',
         'logind-user.c',
         'logind-utmp.c',
@@ -47,10 +48,6 @@ executables += [
                 'dbus' : true,
                 'sources' : systemd_logind_sources,
                 'extract' : systemd_logind_extract_sources,
-                'include_directories' : [libexec_template['include_directories'], include_directories('.')],
-                'dependencies' : [
-                        threads,
-                ],
         },
         executable_template + {
                 'name' : 'loginctl',
@@ -60,7 +57,6 @@ executables += [
                         liblz4_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
         },
         executable_template + {
@@ -79,7 +75,6 @@ executables += [
         test_template + {
                 'sources' : files('test-login-tables.c'),
                 'objects' : ['systemd-logind'],
-                'dependencies' : threads,
         },
         test_template + {
                 'sources' : files('test-session-properties.c'),
@@ -110,7 +105,7 @@ custom_target(
         input : 'logind.conf.in',
         output : 'logind.conf',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
-        install : install_sysconfdir_samples and pkgsysconfdir != 'no',
+        install : install_sysconfdir_samples,
         install_dir : pkgconfigfiledir)
 
 custom_target(

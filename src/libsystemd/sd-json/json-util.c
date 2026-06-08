@@ -9,6 +9,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "glyph-util.h"
+#include "in-addr-util.h"
 #include "iovec-util.h"
 #include "json-util.h"
 #include "log.h"
@@ -189,12 +190,59 @@ int json_dispatch_in_addr(const char *name, sd_json_variant *variant, sd_json_di
                 return 0;
         }
 
+        /* We support a more human readable string based encoding, and an array based encoding */
+        if (sd_json_variant_is_string(variant)) {
+                union in_addr_union a;
+                r = in_addr_from_string(AF_INET, sd_json_variant_string(variant), &a);
+                if (r < 0)
+                        return json_log(variant, flags, r,
+                                        "JSON field '%s' is not a valid IPv4 address string: %s", strna(name), sd_json_variant_string(variant));
+
+                *address = a.in;
+                return 0;
+        }
+
         r = json_dispatch_byte_array_iovec(name, variant, flags, &iov);
         if (r < 0)
                 return r;
 
         if (iov.iov_len != sizeof(struct in_addr))
-                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is array of unexpected size.", strna(name));
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                "Expected JSON field '%s' to be an array of %zu bytes.", strna(name), sizeof(struct in_addr));
+
+        memcpy(address, iov.iov_base, iov.iov_len);
+        return 0;
+}
+
+int json_dispatch_in6_addr(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        struct in6_addr *address = ASSERT_PTR(userdata);
+        _cleanup_(iovec_done) struct iovec iov = {};
+        int r;
+
+        if (sd_json_variant_is_null(variant)) {
+                *address = (struct in6_addr) {};
+                return 0;
+        }
+
+        /* We support both a more human readable string based encoding and an array based encoding */
+        if (sd_json_variant_is_string(variant)) {
+                union in_addr_union a;
+                r = in_addr_from_string(AF_INET6, sd_json_variant_string(variant), &a);
+                if (r < 0)
+                        return json_log(variant, flags, r,
+                                        "JSON field '%s' is not a valid IPv6 address string: %s", strna(name), sd_json_variant_string(variant));
+
+                *address = a.in6;
+                return 0;
+        }
+
+        r = json_dispatch_byte_array_iovec(name, variant, flags, &iov);
+        if (r < 0)
+                return r;
+
+        if (iov.iov_len != sizeof(struct in6_addr))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                "Expected JSON field '%s' to be an array of %zu bytes.", strna(name), sizeof(struct in6_addr));
 
         memcpy(address, iov.iov_base, iov.iov_len);
         return 0;
@@ -243,6 +291,7 @@ int json_dispatch_path(const char *name, sd_json_variant *variant, sd_json_dispa
 int json_dispatch_strv_path(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
         _cleanup_strv_free_ char **n = NULL;
         char ***l = ASSERT_PTR(userdata);
+        size_t s = 0;
         int r;
 
         assert(variant);
@@ -262,7 +311,7 @@ int json_dispatch_strv_path(const char *name, sd_json_variant *variant, sd_json_
                 if (r < 0)
                         return r;
 
-                r = strv_extend(&n, a);
+                r = strv_extend_with_size(&n, &s, a);
                 if (r < 0)
                         return json_log_oom(variant, flags);
         }
@@ -604,6 +653,9 @@ int json_dispatch_strv_environment(const char *name, sd_json_variant *variant, s
         if (!sd_json_variant_is_array(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an array.", strna(name));
 
+        if (sd_json_variant_elements(variant) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG), "Too many environment variable assignments.");
+
         sd_json_variant *i;
         JSON_VARIANT_ARRAY_FOREACH(i, variant) {
                 const char *e;
@@ -685,7 +737,7 @@ int json_variant_new_fd_info(sd_json_variant **ret, int fd) {
         if (r < 0)
                 return r;
 
-        r = name_to_handle_at_try_fid(fd, "", &fid, &mntid, AT_EMPTY_PATH);
+        r = name_to_handle_at_try_fid(fd, "", &fid, &mntid, /* ret_unique_mnt_id = */ NULL, AT_EMPTY_PATH);
         if (r < 0 && is_name_to_handle_at_fatal_error(r))
                 return r;
 
@@ -700,4 +752,169 @@ int json_variant_new_fd_info(sd_json_variant **ret, int fd) {
                         SD_JSON_BUILD_PAIR_VARIANT("stat", v),
                         JSON_BUILD_PAIR_INTEGER_NON_NEGATIVE("mountId", mntid),
                         SD_JSON_BUILD_PAIR_VARIANT("fileHandle", w));
+}
+
+int json_dispatch_access_mode(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        mode_t *m = ASSERT_PTR(userdata);
+        int r;
+
+        if (sd_json_variant_is_null(variant)) {
+                *m = MODE_INVALID;
+                return 0;
+        }
+
+        /* Let the SD_JSON_STRICT determine if we allow suid/sgid/sticky or not */
+        mode_t limit = FLAGS_SET(flags, SD_JSON_STRICT) ? 0777 : 07777;
+
+        if (sd_json_variant_is_string(variant)) {
+                /* NB: we parse the mode in the usual octal if a string is specified. */
+
+                mode_t mode;
+                r = parse_mode(sd_json_variant_string(variant), &mode);
+                if (r < 0)
+                        return json_log(variant, flags, r, "JSON field '%s' is not a valid access mode string.", strna(name));
+
+                if (mode > limit)
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(ERANGE),
+                                        "JSON field '%s' outside of valid range 0%s0%o.",
+                                        strna(name), glyph(GLYPH_ELLIPSIS), limit);
+
+                *m = mode;
+
+        } else if (sd_json_variant_is_unsigned(variant)) {
+
+                uint64_t k = sd_json_variant_unsigned(variant);
+                if (k > (uint64_t) limit)
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(ERANGE),
+                                        "JSON field '%s' outside of valid range 0%s0%o.",
+                                        strna(name), glyph(GLYPH_ELLIPSIS), limit);
+
+                *m = (mode_t) k;
+        } else
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is neither a number nor a string.", strna(name));
+
+        return 0;
+}
+
+int json_dispatch_job_id(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        uint32_t *id = ASSERT_PTR(userdata);
+        uint32_t k;
+        int r;
+
+        if (sd_json_variant_is_null(variant)) {
+                *id = 0;
+                return 0;
+        }
+
+        r = sd_json_dispatch_uint32(name, variant, flags, &k);
+        if (r < 0)
+                return r;
+
+        if (k == 0)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid job ID.", strna(name));
+
+        *id = k;
+        return 0;
+}
+
+int json_variant_compare(sd_json_variant *a, sd_json_variant *b) {
+        int r;
+
+        r = CMP(!!a, !!b);
+        if (r != 0)
+                return r;
+
+        if (sd_json_variant_equal(a, b))
+                return 0;
+
+        if (sd_json_variant_is_null(a))
+                return -1;
+        if (sd_json_variant_is_null(b))
+                return 1;
+
+        if (sd_json_variant_is_string(a) &&
+            sd_json_variant_is_string(b))
+                return strcmp(sd_json_variant_string(a), sd_json_variant_string(b));
+
+        if (sd_json_variant_is_integer(a) &&
+            sd_json_variant_is_integer(b))
+                return CMP(sd_json_variant_integer(a), sd_json_variant_integer(b));
+
+        if (sd_json_variant_is_unsigned(a) &&
+            sd_json_variant_is_unsigned(b))
+                return CMP(sd_json_variant_unsigned(a), sd_json_variant_unsigned(b));
+
+        /* We cannot necessarily compare 64bit signed with unsigned, hence we go via sign checking instead */
+        if (sd_json_variant_is_number(a) && sd_json_variant_is_number(b)) {
+                if (sd_json_variant_is_negative(a) &&
+                    !sd_json_variant_is_negative(b))
+                        return -1;
+
+                if (!sd_json_variant_is_negative(a) &&
+                    sd_json_variant_is_negative(b))
+                        return 1;
+        }
+
+        if (sd_json_variant_is_real(a) &&
+            sd_json_variant_is_real(b))
+                return CMP(sd_json_variant_real(a), sd_json_variant_real(b));
+
+        if (sd_json_variant_is_boolean(a) &&
+            sd_json_variant_is_boolean(b))
+                return CMP(sd_json_variant_boolean(a), sd_json_variant_boolean(b));
+
+        if (sd_json_variant_is_array(a) &&
+            sd_json_variant_is_array(b)) {
+
+                size_t n = sd_json_variant_elements(a),
+                        m = sd_json_variant_elements(b);
+                for (size_t i = 0; i < n || i < m; i++) {
+
+                        if (i >= n)
+                                return -1;
+                        if (i >= m)
+                                return 1;
+
+                        r = json_variant_compare(
+                                        sd_json_variant_by_index(a, i),
+                                        sd_json_variant_by_index(b, i));
+                        if (r != 0)
+                                return r;
+                }
+
+                return 0;
+        }
+
+        if (sd_json_variant_is_object(a) &&
+            sd_json_variant_is_object(b)) {
+                const char *k, *lowest = NULL;
+                sd_json_variant *v;
+                int result = 0;
+
+                JSON_VARIANT_OBJECT_FOREACH(k, v, a) {
+                        if (lowest && strcmp(k, lowest) >= 0)
+                                continue;
+
+                        r = json_variant_compare(v, sd_json_variant_by_key(b, k));
+                        if (r != 0) {
+                                lowest = k;
+                                result = r;
+                        }
+                }
+
+                JSON_VARIANT_OBJECT_FOREACH(k, v, b) {
+                        if (lowest && strcmp(k, lowest) >= 0)
+                                continue;
+
+                        r = json_variant_compare(v, sd_json_variant_by_key(a, k));
+                        if (r != 0) {
+                                lowest = k;
+                                result = -r;
+                        }
+                }
+
+                return result;
+        }
+
+        return CMP(sd_json_variant_type(a), sd_json_variant_type(b));
 }

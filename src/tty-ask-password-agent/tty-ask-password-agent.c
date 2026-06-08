@@ -4,7 +4,6 @@
 ***/
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
@@ -23,13 +22,16 @@
 #include "errno-util.h"
 #include "exit-status.h"
 #include "fd-util.h"
-#include "format-util.h"
 #include "fileio.h"
+#include "format-table.h"
+#include "format-util.h"
 #include "inotify-util.h"
 #include "io-util.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
+#include "options.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "set.h"
@@ -441,112 +443,84 @@ static int process_and_watch_password_files(bool watch) {
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
+        _cleanup_(table_unrefp) Table *options = NULL;
         int r;
 
         r = terminal_urlify_man("systemd-tty-ask-password-agent", "1", &link);
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...]\n\n"
-               "%sProcess system password requests.%s\n\n"
-               "  -h --help              Show this help\n"
-               "     --version           Show package version\n"
-               "     --list              Show pending password requests\n"
-               "     --query             Process pending password requests\n"
-               "     --watch             Continuously process password requests\n"
-               "     --wall              Continuously forward password requests to wall\n"
-               "     --plymouth          Ask question with Plymouth instead of on TTY\n"
-               "     --console[=DEVICE]  Ask question on /dev/console (or DEVICE if specified)\n"
-               "                         instead of the current TTY\n"
-               "\nSee the %s for details.\n",
+        r = option_parser_get_help_table(&options);
+        if (r < 0)
+                return r;
+
+        printf("%s [OPTIONS...]\n"
+               "\n%sProcess system password requests.%s\n\n",
                program_invocation_short_name,
                ansi_highlight(),
-               ansi_normal(),
-               link);
+               ansi_normal());
 
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
+
+        printf("\nSee the %s for details.\n", link);
         return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_LIST = 0x100,
-                ARG_QUERY,
-                ARG_WATCH,
-                ARG_WALL,
-                ARG_PLYMOUTH,
-                ARG_CONSOLE,
-                ARG_VERSION
-        };
-
-        static const struct option options[] = {
-                { "help",     no_argument,       NULL, 'h'          },
-                { "version",  no_argument,       NULL, ARG_VERSION  },
-                { "list",     no_argument,       NULL, ARG_LIST     },
-                { "query",    no_argument,       NULL, ARG_QUERY    },
-                { "watch",    no_argument,       NULL, ARG_WATCH    },
-                { "wall",     no_argument,       NULL, ARG_WALL     },
-                { "plymouth", no_argument,       NULL, ARG_PLYMOUTH },
-                { "console",  optional_argument, NULL, ARG_CONSOLE  },
-                {}
-        };
-
-        int r, c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
+                OPTION_COMMON_HELP:
                         return help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_LIST:
+                OPTION_LONG("list", NULL, "Show pending password requests"):
                         arg_action = ACTION_LIST;
                         break;
 
-                case ARG_QUERY:
+                OPTION_LONG("query", NULL, "Process pending password requests"):
                         arg_action = ACTION_QUERY;
                         break;
 
-                case ARG_WATCH:
+                OPTION_LONG("watch", NULL, "Continuously process password requests"):
                         arg_action = ACTION_WATCH;
                         break;
 
-                case ARG_WALL:
+                OPTION_LONG("wall", NULL, "Continuously forward password requests to wall"):
                         arg_action = ACTION_WALL;
                         break;
 
-                case ARG_PLYMOUTH:
+                OPTION_LONG("plymouth", NULL,
+                            "Ask question with Plymouth instead of on TTY"):
                         arg_plymouth = true;
                         break;
 
-                case ARG_CONSOLE:
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "console", "DEVICE",
+                                  "Ask question on /dev/console (or DEVICE if specified) instead of the current TTY"):
                         arg_console = true;
-                        if (optarg) {
-                                if (isempty(optarg))
+                        if (opts.arg) {
+                                if (isempty(opts.arg))
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                                "Empty console device path is not allowed.");
 
-                                r = free_and_strdup_warn(&arg_device, optarg);
+                                r = free_and_strdup_warn(&arg_device, opts.arg);
                                 if (r < 0)
                                         return r;
                         }
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
-        if (optind != argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s takes no arguments.", program_invocation_short_name);
 
@@ -570,18 +544,18 @@ static int parse_argv(int argc, char *argv[]) {
  * and its own controlling terminal. If one of the tasks does handle a password, the remaining tasks will be
  * terminated.
  */
-static int ask_on_this_console(const char *tty, char **arguments, pid_t *ret_pid) {
+static int ask_on_this_console(const char *tty, char **arguments, PidRef *ret) {
         int r;
 
         assert(tty);
         assert(arguments);
-        assert(ret_pid);
+        assert(ret);
 
         assert_se(sigaction(SIGCHLD, &sigaction_nop_nocldstop, NULL) >= 0);
         assert_se(sigaction(SIGHUP, &sigaction_default, NULL) >= 0);
         assert_se(sigprocmask_many(SIG_UNBLOCK, NULL, SIGHUP, SIGCHLD) >= 0);
 
-        r = safe_fork("(sd-passwd)", FORK_RESET_SIGNALS|FORK_KEEP_NOTIFY_SOCKET|FORK_LOG, ret_pid);
+        r = pidref_safe_fork("(sd-passwd)", FORK_RESET_SIGNALS|FORK_KEEP_NOTIFY_SOCKET|FORK_LOG, ret);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -687,17 +661,17 @@ static int ask_on_consoles(char *argv[]) {
          *
          * Note that when any agent exits STOPPING=1 would also be sent, but that's utterly what we want,
          * i.e. the password is answered on one console and other agents get killed below. */
-        (void) sd_notify(/* unset_environment = */ false, "NOTIFYACCESS=all");
+        (void) sd_notify(/* unset_environment= */ false, "NOTIFYACCESS=all");
 
         /* Start an agent on each console. */
         STRV_FOREACH(tty, consoles) {
-                pid_t pid;
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
 
-                r = ask_on_this_console(*tty, arguments, &pid);
+                r = ask_on_this_console(*tty, arguments, &pidref);
                 if (r < 0)
                         return r;
 
-                if (set_put(pids, PID_TO_PTR(pid)) < 0)
+                if (set_put(pids, PID_TO_PTR(pidref.pid)) < 0)
                         return log_oom();
         }
 

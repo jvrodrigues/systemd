@@ -22,6 +22,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
+#include "user-util.h"
 
 /* TODO:
  * OCI runtime tool implementation
@@ -684,6 +685,10 @@ static int oci_uid_gid_mappings(const char *name, sd_json_variant *v, sd_json_di
         r = oci_dispatch(e, table, flags, &data);
         if (r < 0)
                 return r;
+
+        /* Silence static analyzers, sd_json_dispatch_uid_gid() already validates */
+        assert(uid_is_valid(data.host_id));
+        assert(uid_is_valid(data.container_id));
 
         if (data.range > UINT32_MAX - data.host_id ||
             data.range > UINT32_MAX - data.container_id)
@@ -1489,6 +1494,8 @@ static int oci_resources(const char *name, sd_json_variant *v, sd_json_dispatch_
 static bool sysctl_key_valid(const char *s) {
         bool dot = true;
 
+        POINTER_MAY_BE_NULL(s);
+
         /* Note that we are a bit stricter here than in systemd-sysctl, as that inherited semantics from the old sysctl
          * tool, which were really weird (as it swaps / and . in both ways) */
 
@@ -1546,7 +1553,6 @@ static int oci_sysctl(const char *name, sd_json_variant *v, sd_json_dispatch_fla
 
 #if HAVE_SECCOMP
 static int oci_seccomp_action_from_string(const char *name, uint32_t *ret) {
-
         static const struct {
                 const char *name;
                 uint32_t action;
@@ -1554,20 +1560,16 @@ static int oci_seccomp_action_from_string(const char *name, uint32_t *ret) {
                 { "SCMP_ACT_ALLOW",         SCMP_ACT_ALLOW        },
                 { "SCMP_ACT_ERRNO",         SCMP_ACT_ERRNO(EPERM) }, /* the OCI spec doesn't document the error, but it appears EPERM is supposed to be used */
                 { "SCMP_ACT_KILL",          SCMP_ACT_KILL         },
-#ifdef SCMP_ACT_KILL_PROCESS
                 { "SCMP_ACT_KILL_PROCESS",  SCMP_ACT_KILL_PROCESS },
-#endif
-#ifdef SCMP_ACT_KILL_THREAD
                 { "SCMP_ACT_KILL_THREAD",   SCMP_ACT_KILL_THREAD  },
-#endif
-#ifdef SCMP_ACT_LOG
                 { "SCMP_ACT_LOG",           SCMP_ACT_LOG          },
-#endif
                 { "SCMP_ACT_TRAP",          SCMP_ACT_TRAP         },
 
                 /* We don't support SCMP_ACT_TRACE because that requires a tracer, and that doesn't really make sense
                  * here */
         };
+
+        assert(ret);
 
         FOREACH_ELEMENT(i, table)
                 if (streq_ptr(name, i->name)) {
@@ -1579,7 +1581,6 @@ static int oci_seccomp_action_from_string(const char *name, uint32_t *ret) {
 }
 
 static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
-
         static const struct {
                 const char *name;
                 uint32_t arch;
@@ -1596,12 +1597,8 @@ static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
                 { "SCMP_ARCH_MIPSEL64",    SCMP_ARCH_MIPSEL64    },
                 { "SCMP_ARCH_MIPSEL64N32", SCMP_ARCH_MIPSEL64N32 },
                 { "SCMP_ARCH_NATIVE",      SCMP_ARCH_NATIVE      },
-#ifdef SCMP_ARCH_PARISC
                 { "SCMP_ARCH_PARISC",      SCMP_ARCH_PARISC      },
-#endif
-#ifdef SCMP_ARCH_PARISC64
                 { "SCMP_ARCH_PARISC64",    SCMP_ARCH_PARISC64    },
-#endif
                 { "SCMP_ARCH_PPC",         SCMP_ARCH_PPC         },
                 { "SCMP_ARCH_PPC64",       SCMP_ARCH_PPC64       },
                 { "SCMP_ARCH_PPC64LE",     SCMP_ARCH_PPC64LE     },
@@ -1615,6 +1612,8 @@ static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
                 { "SCMP_ARCH_X86_64",      SCMP_ARCH_X86_64      },
         };
 
+        assert(ret);
+
         FOREACH_ELEMENT(i, table)
                 if (streq_ptr(i->name, name)) {
                         *ret = i->arch;
@@ -1625,7 +1624,6 @@ static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
 }
 
 static int oci_seccomp_compare_from_string(const char *name, enum scmp_compare *ret) {
-
         static const struct {
                 const char *name;
                 enum scmp_compare op;
@@ -1638,6 +1636,8 @@ static int oci_seccomp_compare_from_string(const char *name, enum scmp_compare *
                 { "SCMP_CMP_GT",        SCMP_CMP_GT        },
                 { "SCMP_CMP_MASKED_EQ", SCMP_CMP_MASKED_EQ },
         };
+
+        assert(ret);
 
         FOREACH_ELEMENT(i, table)
                 if (streq_ptr(i->name, name)) {
@@ -1826,7 +1826,7 @@ static int oci_seccomp(const char *name, sd_json_variant *v, sd_json_dispatch_fl
         if (r < 0)
                 return json_log(def, flags, r, "Unknown default action: %s", sd_json_variant_string(def));
 
-        r = dlopen_libseccomp();
+        r = DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0)
                 return json_log(def, flags, r, "No support for libseccomp: %m");
 
@@ -2082,6 +2082,7 @@ int oci_load(FILE *f, const char *bundle, Settings **ret) {
         int r;
 
         assert_se(bundle);
+        assert(ret);
 
         path = strjoina(bundle, "/config.json");
 

@@ -3,6 +3,9 @@
 #include <fcntl.h>
 #include <linux/if.h>
 #include <linux/if_arp.h>
+#include <linux/if_ether.h>
+#include <linux/if_infiniband.h>
+#include <linux/pkt_sched.h>
 #include <mqueue.h>
 #include <net/if.h>
 #include <netdb.h>
@@ -360,6 +363,7 @@ int sockaddr_port(const struct sockaddr *_sa, unsigned *ret_port) {
         /* Note, this returns the port as 'unsigned' rather than 'uint16_t', as AF_VSOCK knows larger ports */
 
         assert(sa);
+        assert(ret_port);
 
         switch (sa->sa.sa_family) {
 
@@ -824,6 +828,8 @@ bool ifname_valid_full(const char *p, IfnameValidFlags flags) {
 
 bool address_label_valid(const char *p) {
 
+        POINTER_MAY_BE_NULL(p);
+
         if (isempty(p))
                 return false;
 
@@ -970,53 +976,6 @@ int getpeerpidref(int fd, PidRef *ret) {
         return pidref_set_pidfd_consume(ret, pidfd);
 }
 
-ssize_t send_many_fds_iov_sa(
-                int transport_fd,
-                int *fds_array, size_t n_fds_array,
-                const struct iovec *iov, size_t iovlen,
-                const struct sockaddr *sa, socklen_t len,
-                int flags) {
-
-        _cleanup_free_ struct cmsghdr *cmsg = NULL;
-        struct msghdr mh = {
-                .msg_name = (struct sockaddr*) sa,
-                .msg_namelen = len,
-                .msg_iov = (struct iovec *)iov,
-                .msg_iovlen = iovlen,
-        };
-        ssize_t k;
-
-        assert(transport_fd >= 0);
-        assert(fds_array || n_fds_array == 0);
-
-        /* The kernel will reject sending more than SCM_MAX_FD FDs at once */
-        if (n_fds_array > SCM_MAX_FD)
-                return -E2BIG;
-
-        /* We need either an FD array or data to send. If there's nothing, return an error. */
-        if (n_fds_array == 0 && !iov)
-                return -EINVAL;
-
-        if (n_fds_array > 0) {
-                mh.msg_controllen = CMSG_SPACE(sizeof(int) * n_fds_array);
-                mh.msg_control = cmsg = malloc(mh.msg_controllen);
-                if (!cmsg)
-                        return -ENOMEM;
-
-                *cmsg = (struct cmsghdr) {
-                        .cmsg_len = CMSG_LEN(sizeof(int) * n_fds_array),
-                        .cmsg_level = SOL_SOCKET,
-                        .cmsg_type = SCM_RIGHTS,
-                };
-                memcpy(CMSG_DATA(cmsg), fds_array, sizeof(int) * n_fds_array);
-        }
-        k = sendmsg(transport_fd, &mh, MSG_NOSIGNAL | flags);
-        if (k < 0)
-                return (ssize_t) -errno;
-
-        return k;
-}
-
 ssize_t send_one_fd_iov_sa(
                 int transport_fd,
                 int fd,
@@ -1070,74 +1029,6 @@ int send_one_fd_sa(
         assert(fd >= 0);
 
         return (int) send_one_fd_iov_sa(transport_fd, fd, NULL, 0, sa, len, flags);
-}
-
-ssize_t receive_many_fds_iov(
-                int transport_fd,
-                struct iovec *iov, size_t iovlen,
-                int **ret_fds_array, size_t *ret_n_fds_array,
-                int flags) {
-
-        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int) * SCM_MAX_FD)) control;
-        struct msghdr mh = {
-                .msg_control = &control,
-                .msg_controllen = sizeof(control),
-                .msg_iov = iov,
-                .msg_iovlen = iovlen,
-        };
-        _cleanup_free_ int *fds_array = NULL;
-        size_t n_fds_array = 0;
-        struct cmsghdr *cmsg;
-        ssize_t k;
-
-        assert(transport_fd >= 0);
-        assert(ret_fds_array);
-        assert(ret_n_fds_array);
-
-        /*
-         * Receive many FDs via @transport_fd. We don't care for the transport-type. We retrieve all the FDs
-         * at once. This is best used in combination with send_many_fds().
-         */
-
-        k = recvmsg_safe(transport_fd, &mh, MSG_CMSG_CLOEXEC | flags);
-        if (k < 0)
-                return k;
-
-        CMSG_FOREACH(cmsg, &mh)
-                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-                        size_t n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-
-                        if (!GREEDY_REALLOC_APPEND(fds_array, n_fds_array, CMSG_TYPED_DATA(cmsg, int), n)) {
-                                cmsg_close_all(&mh);
-                                return -ENOMEM;
-                        }
-                }
-
-        if (n_fds_array == 0) {
-                cmsg_close_all(&mh);
-
-                /* If didn't receive an FD or any data, return an error. */
-                if (k == 0)
-                        return -EIO;
-        }
-
-        *ret_fds_array = TAKE_PTR(fds_array);
-        *ret_n_fds_array = n_fds_array;
-
-        return k;
-}
-
-int receive_many_fds(int transport_fd, int **ret_fds_array, size_t *ret_n_fds_array, int flags) {
-        ssize_t k;
-
-        k = receive_many_fds_iov(transport_fd, NULL, 0, ret_fds_array, ret_n_fds_array, flags);
-        if (k == 0)
-                return 0;
-
-        /* k must be negative, since receive_many_fds_iov() only returns a positive value if data was received
-         * through the iov. */
-        assert(k < 0);
-        return (int) k;
 }
 
 ssize_t receive_one_fd_iov(
@@ -1263,14 +1154,10 @@ int flush_accept(int fd) {
                 int cfd;
 
                 r = fd_wait_for_event(fd, POLLIN, 0);
-                if (r < 0) {
-                        if (r == -EINTR)
-                                continue;
-
+                if (r == -EINTR)
+                        continue;
+                if (r <= 0)
                         return r;
-                }
-                if (r == 0)
-                        return 0;
 
                 if (iteration >= MAX_FLUSH_ITERATIONS)
                         return log_debug_errno(SYNTHETIC_ERRNO(EBUSY),
@@ -1305,12 +1192,10 @@ ssize_t flush_mqueue(int fd) {
                 ssize_t l;
 
                 r = fd_wait_for_event(fd, POLLIN, /* timeout= */ 0);
-                if (r < 0) {
-                        if (r == -EINTR)
-                                continue;
-
+                if (r == -EINTR)
+                        continue;
+                if (r < 0)
                         return r;
-                }
                 if (r == 0)
                         return count;
 
@@ -1324,7 +1209,7 @@ ssize_t flush_mqueue(int fd) {
                                 return -ENOMEM;
                 }
 
-                l = mq_receive(fd, buf, attr.mq_msgsize, /* msg_prio = */ NULL);
+                l = mq_receive(fd, buf, attr.mq_msgsize, /* msg_prio= */ NULL);
                 if (l < 0) {
                         if (errno == EINTR)
                                 continue;
@@ -1677,6 +1562,8 @@ int socket_set_option(int fd, int af, int opt_ipv4, int opt_ipv6, int val) {
 int socket_get_mtu(int fd, int af, size_t *ret) {
         int mtu, r;
 
+        assert(ret);
+
         if (af == AF_UNSPEC) {
                 af = socket_get_family(fd);
                 if (af < 0)
@@ -1734,13 +1621,17 @@ int connect_unix_path(int fd, int dir_fd, const char *path) {
         _cleanup_close_ int inode_fd = -EBADF;
 
         assert(fd >= 0);
-        assert(dir_fd == AT_FDCWD || dir_fd >= 0);
+        assert(wildcard_fd_is_valid(dir_fd));
 
         /* Connects to the specified AF_UNIX socket in the file system. Works around the 108 byte size limit
          * in sockaddr_un, by going via O_PATH if needed. This hence works for any kind of path. */
 
-        if (!path)
+        if (!path) {
+                if (dir_fd < 0)
+                        return -EISDIR;
+
                 return connect_unix_inode(fd, dir_fd); /* If no path is specified, then dir_fd refers to the socket inode to connect to. */
+        }
 
         /* Refuse zero length path early, to make sure AF_UNIX stack won't mistake this for an abstract
          * namespace path, since first char is NUL */
@@ -1755,7 +1646,14 @@ int connect_unix_path(int fd, int dir_fd, const char *path) {
          * exist. If the path is too long, we also need to take the indirect route, since we can't fit this
          * into a sockaddr_un directly. */
 
-        inode_fd = openat(dir_fd, path, O_PATH|O_CLOEXEC);
+        if (dir_fd == XAT_FDROOT) {
+                _cleanup_free_ char *j = strjoin("/", path);
+                if (!j)
+                        return -ENOMEM;
+
+                inode_fd = open(j, O_PATH|O_CLOEXEC);
+        } else
+                inode_fd = openat(dir_fd, path, O_PATH|O_CLOEXEC);
         if (inode_fd < 0)
                 return -errno;
 
@@ -1915,7 +1813,7 @@ int vsock_get_local_cid(unsigned *ret) {
         /* If ret == NULL, we're just want to check if AF_VSOCK is available, so accept
          * any address. Otherwise, filter out special addresses that are cannot be used
          * to identify _this_ machine from the outside. */
-        if (ret && IN_SET(tmp, VMADDR_CID_LOCAL, VMADDR_CID_HOST))
+        if (ret && IN_SET(tmp, VMADDR_CID_LOCAL, VMADDR_CID_HOST, VMADDR_CID_ANY))
                 return log_debug_errno(SYNTHETIC_ERRNO(EADDRNOTAVAIL),
                                        "IOCTL_VM_SOCKETS_GET_LOCAL_CID returned special value (%u), ignoring.", tmp);
 
@@ -1987,5 +1885,31 @@ void cmsg_close_all(struct msghdr *mh) {
                         assert(cmsg->cmsg_len == CMSG_LEN(sizeof(int)));
                         safe_close(*CMSG_TYPED_DATA(cmsg, int));
                 }
+        }
+}
+
+int tos_to_priority(uint8_t tos) {
+        /* Map the IP Precedence (top 3 bits of the TOS field) to Linux internal packet priorities
+         * (TC_PRIO_*). This exactly mirrors the standard Linux kernel IP precedence-to-priority mapping
+         * (rt_tos2priority) to ensure consistent behavior when explicitly setting SO_PRIORITY. */
+        switch (IPTOS_PREC(tos)) {
+        case IPTOS_PREC_NETCONTROL:      /* 0xc0 (CS7) - Network Control. Used for infrastructure control (e.g., STP, keepalives). */
+        case IPTOS_PREC_INTERNETCONTROL: /* 0xe0 (CS6) - Internetwork Control. Used for routing protocols (e.g., OSPF, BGP) and DHCP. */
+                return TC_PRIO_CONTROL;
+
+        case IPTOS_PREC_CRITIC_ECP:      /* 0xa0 (CS5) - Critical. Used for delay-sensitive traffic like Voice over IP (VoIP). */
+        case IPTOS_PREC_FLASHOVERRIDE:   /* 0x80 (CS4) - Flash Override. Used for interactive video and multimedia. */
+                return TC_PRIO_INTERACTIVE;
+
+        case IPTOS_PREC_FLASH:           /* 0x60 (CS3) - Flash. Used for broadcast video and call signaling (e.g., SIP). */
+        case IPTOS_PREC_IMMEDIATE:       /* 0x40 (CS2) - Immediate. Used for OAM (Operations, Administration, and Management) and transactional data. */
+                return TC_PRIO_INTERACTIVE_BULK;
+
+        case IPTOS_PREC_PRIORITY:        /* 0x20 (CS1) - Priority. Used for background traffic and bulk data transfers. */
+                return TC_PRIO_BULK;
+
+        case IPTOS_PREC_ROUTINE:         /* 0x00 (CS0) - Routine. Best effort traffic. */
+        default:
+                return TC_PRIO_BESTEFFORT;
         }
 }

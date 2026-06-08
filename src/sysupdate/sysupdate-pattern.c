@@ -406,7 +406,7 @@ int pattern_match(const char *pattern, const char *s, InstanceMetadata *ret) {
                         if (strlen(t) != sizeof(found.sha256sum) * 2)
                                 goto nope;
 
-                        r = unhexmem_full(t, sizeof(found.sha256sum) * 2, /* secure = */ false, &d, &l);
+                        r = unhexmem_full(t, sizeof(found.sha256sum) * 2, /* secure= */ false, &d, &l);
                         if (r == -ENOMEM)
                                 return r;
                         if (r < 0)
@@ -420,11 +420,15 @@ int pattern_match(const char *pattern, const char *s, InstanceMetadata *ret) {
                 }
 
                 default:
-                        assert_se("unexpected pattern element");
+                        assert_not_reached();
                 }
 
                 p = n;
         }
+
+        /* We matched the whole pattern, but if the string continues over the end of the pattern, refuse */
+        if (*p != '\0')
+                goto nope;
 
         if (ret) {
                 *ret = found;

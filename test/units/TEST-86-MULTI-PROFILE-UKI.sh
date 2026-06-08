@@ -5,6 +5,11 @@ set -o pipefail
 
 export SYSTEMD_LOG_LEVEL=debug
 
+if ! systemd-analyze has-tpm2; then
+    echo "Full TPM2 support not available, skipping the test"
+    exit 0
+fi
+
 bootctl
 
 CURRENT_UKI=$(bootctl --print-stub-path)
@@ -59,6 +64,9 @@ elif [[ "$ID" == "profile1" ]]; then
 elif [[ "$ID" == "profile2" ]]; then
     grep testprofile2=1 /proc/cmdline
     rm /root/encrypted.raw
+    # Reset the default boot entry so a subsequent re-run of the test does not
+    # boot straight back into @profile2 (where encrypted.raw is now gone) and fail.
+    bootctl set-default ""
 else
     exit 1
 fi

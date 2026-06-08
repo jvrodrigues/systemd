@@ -20,7 +20,7 @@
 #include "hashmap.h"
 #include "hexdecoct.h"
 #include "label-util.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "selinux-util.h"
@@ -79,84 +79,48 @@ static int node_create_symlink(sd_device *dev, const char *devnode, const char *
 }
 
 static int stack_directory_read_one(int dirfd, const char *id, char **devnode, int *priority) {
-        _cleanup_free_ char *buf = NULL;
-        int tmp_prio, r;
+        int r;
 
         assert(dirfd >= 0);
         assert(id);
         assert(priority);
 
-        /* This reads priority and device node from the symlink under /run/udev/links (or udev database).
+        /* This reads priority and device node from the symlink under /run/udev/links/ directory.
          * If 'devnode' is NULL, obtained priority is always set to '*priority'. If 'devnode' is non-NULL,
-         * this updates '*devnode' and '*priority'. */
+         * this updates '*devnode' and '*priority' if the obtained one has a higher priority. */
 
-        /* First, let's try to read the entry with the new format, which should replace the old format pretty
-         * quickly. */
+        _cleanup_free_ char *buf = NULL;
         r = readlinkat_malloc(dirfd, id, &buf);
-        if (r >= 0) {
-                char *colon;
+        if (r < 0)
+                return r == -ENOENT ? -ENODEV : r;
 
-                /* With the new format, the devnode and priority can be obtained from symlink itself. */
+        char *colon = strchr(buf, ':');
+        if (!colon || colon == buf)
+                return -EINVAL;
 
-                colon = strchr(buf, ':');
-                if (!colon || colon == buf)
-                        return -EINVAL;
+        *colon = '\0';
 
-                *colon = '\0';
+        /* Of course, this check is racy, but it is not necessary to be perfect. Even if the device
+         * node will be removed after this check, we will receive 'remove' uevent, and the invalid
+         * symlink will be removed during processing the event. The check is just for shortening the
+         * timespan that the symlink points to a non-existing device node. */
+        if (access(colon + 1, F_OK) < 0)
+                return -ENODEV;
 
-                /* Of course, this check is racy, but it is not necessary to be perfect. Even if the device
-                 * node will be removed after this check, we will receive 'remove' uevent, and the invalid
-                 * symlink will be removed during processing the event. The check is just for shortening the
-                 * timespan that the symlink points to a non-existing device node. */
-                if (access(colon + 1, F_OK) < 0)
-                        return -ENODEV;
+        int tmp_prio;
+        r = safe_atoi(buf, &tmp_prio);
+        if (r < 0)
+                return r;
 
-                r = safe_atoi(buf, &tmp_prio);
-                if (r < 0)
-                        return r;
-
-                if (!devnode)
-                        goto finalize;
-
+        if (devnode) {
                 if (*devnode && tmp_prio <= *priority)
                         return 0; /* Unchanged */
 
                 r = free_and_strdup(devnode, colon + 1);
                 if (r < 0)
                         return r;
+        }
 
-        } else if (r == -EINVAL) { /* Not a symlink ? try the old format */
-                _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
-                const char *val;
-
-                /* Old format. The devnode and priority must be obtained from uevent and udev database. */
-
-                r = sd_device_new_from_device_id(&dev, id);
-                if (r < 0)
-                        return r;
-
-                r = device_get_devlink_priority(dev, &tmp_prio);
-                if (r < 0)
-                        return r;
-
-                if (!devnode)
-                        goto finalize;
-
-                if (*devnode && tmp_prio <= *priority)
-                        return 0; /* Unchanged */
-
-                r = sd_device_get_devname(dev, &val);
-                if (r < 0)
-                        return r;
-
-                r = free_and_strdup(devnode, val);
-                if (r < 0)
-                        return r;
-
-        } else
-                return r == -ENOENT ? -ENODEV : r;
-
-finalize:
         *priority = tmp_prio;
         return 1; /* Updated */
 }
@@ -545,7 +509,7 @@ static int link_update(sd_device *dev, const char *slink, bool add) {
 
         /* This device has the equal or a higher priority than the current. Let's create the devlink to our
          * device node. */
-        return node_create_symlink(dev, /* devnode = */ NULL, slink);
+        return node_create_symlink(dev, /* devnode= */ NULL, slink);
 }
 
 static int device_get_devpath_by_devnum(sd_device *dev, char **ret) {
@@ -583,7 +547,7 @@ int udev_node_update(sd_device *dev, sd_device *dev_old) {
                                  "Removing/updating old device symlink '%s', which is no longer belonging to this device.",
                                  devlink);
 
-                r = link_update(dev, devlink, /* add = */ false);
+                r = link_update(dev, devlink, /* add= */ false);
                 if (r < 0)
                         log_device_warning_errno(dev, r,
                                                  "Failed to remove/update device symlink '%s', ignoring: %m",
@@ -592,7 +556,7 @@ int udev_node_update(sd_device *dev, sd_device *dev_old) {
 
         /* create/update symlinks, add symlinks to name index */
         FOREACH_DEVICE_DEVLINK(dev, devlink) {
-                r = link_update(dev, devlink, /* add = */ true);
+                r = link_update(dev, devlink, /* add= */ true);
                 if (r < 0)
                         log_device_warning_errno(dev, r,
                                                  "Failed to create/update device symlink '%s', ignoring: %m",
@@ -604,7 +568,7 @@ int udev_node_update(sd_device *dev, sd_device *dev_old) {
                 return log_device_debug_errno(dev, r, "Failed to get device path: %m");
 
         /* always add /dev/{block,char}/$major:$minor */
-        r = node_create_symlink(dev, /* devnode = */ NULL, filename);
+        r = node_create_symlink(dev, /* devnode= */ NULL, filename);
         if (r < 0)
                 return log_device_warning_errno(dev, r, "Failed to create device symlink '%s': %m", filename);
 
@@ -619,7 +583,7 @@ int udev_node_remove(sd_device *dev) {
 
         /* remove/update symlinks, remove symlinks from name index */
         FOREACH_DEVICE_DEVLINK(dev, devlink) {
-                r = link_update(dev, devlink, /* add = */ false);
+                r = link_update(dev, devlink, /* add= */ false);
                 if (r < 0)
                         log_device_warning_errno(dev, r,
                                                  "Failed to remove/update device symlink '%s', ignoring: %m",

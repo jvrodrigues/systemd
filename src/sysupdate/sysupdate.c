@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
@@ -16,6 +15,7 @@
 #include "loop-util.h"
 #include "main-func.h"
 #include "mount-util.h"
+#include "options.h"
 #include "os-util.h"
 #include "pager.h"
 #include "parse-argument.h"
@@ -23,7 +23,6 @@
 #include "path-util.h"
 #include "pretty-print.h"
 #include "set.h"
-#include "signal-util.h"
 #include "sort-util.h"
 #include "specifier.h"
 #include "string-util.h"
@@ -112,11 +111,7 @@ static Context* context_new(void) {
         return new0(Context, 1);
 }
 
-static void free_transfers(Transfer **array, size_t n) {
-        FOREACH_ARRAY(t, array, n)
-                transfer_free(*t);
-        free(array);
-}
+static DEFINE_POINTER_ARRAY_FREE_FUNC(Transfer*, transfer_free);
 
 static int read_definitions(
                 Context *c,
@@ -129,15 +124,17 @@ static int read_definitions(
         size_t n_files = 0, n_transfers = 0, n_disabled = 0;
         int r;
 
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
-        CLEANUP_ARRAY(transfers, n_transfers, free_transfers);
-        CLEANUP_ARRAY(disabled, n_disabled, free_transfers);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
+        CLEANUP_ARRAY(transfers, n_transfers, transfer_free_array);
+        CLEANUP_ARRAY(disabled, n_disabled, transfer_free_array);
 
         assert(c);
         assert(dirs);
         assert(suffix);
 
-        r = conf_files_list_strv_full(suffix, arg_root, CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED, dirs, &files, &n_files);
+        r = conf_files_list_strv_full(suffix, arg_root,
+                                      CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED|CONF_FILES_WARN,
+                                      dirs, &files, &n_files);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate sysupdate.d/*%s definitions: %m", suffix);
 
@@ -174,7 +171,12 @@ static int read_definitions(
         return 0;
 }
 
-static int context_read_definitions(Context *c, const char* node, bool requires_enabled_transfers) {
+typedef enum ReadDefinitionsFlags {
+        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS = 1 << 0,
+        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS     = 1 << 1,
+} ReadDefinitionsFlags;
+
+static int context_read_definitions(Context *c, const char* node, ReadDefinitionsFlags flags) {
         _cleanup_strv_free_ char **dirs = NULL;
         int r;
 
@@ -207,10 +209,10 @@ static int context_read_definitions(Context *c, const char* node, bool requires_
         ConfFile **files = NULL;
         size_t n_files = 0;
 
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
         r = conf_files_list_strv_full(".feature", arg_root,
-                                      CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED,
+                                      CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED|CONF_FILES_WARN,
                                       (const char**) dirs, &files, &n_files);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate sysupdate.d/*.feature definitions: %m");
@@ -247,7 +249,8 @@ static int context_read_definitions(Context *c, const char* node, bool requires_
                         log_warning("As of v257, transfer definitions should have the '.transfer' extension.");
         }
 
-        if (c->n_transfers + (requires_enabled_transfers ? 0 : c->n_disabled_transfers) == 0) {
+        if (FLAGS_SET(flags, READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS) &&
+            c->n_transfers + (FLAGS_SET(flags, READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS) ? 0 : c->n_disabled_transfers) == 0) {
                 if (arg_component)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                                "No transfer definitions for component '%s' found.",
@@ -396,13 +399,12 @@ static int context_discover_update_sets_by_flag(Context *c, UpdateSetFlags flags
                                 assert(flags == UPDATE_INSTALLED);
 
                                 match = resource_find_instance(&t->target, cursor);
-                                if (!match) {
+                                if (!match && !(extra_flags & (UPDATE_PARTIAL|UPDATE_PENDING)))
                                         /* When we're looking for installed versions, let's be robust and treat
                                          * an incomplete installation as an installation. Otherwise, there are
                                          * situations that can lead to sysupdate wiping the currently booted OS.
                                          * See https://github.com/systemd/systemd/issues/33339 */
                                         extra_flags |= UPDATE_INCOMPLETE;
-                                }
                         }
 
                         cursor_instances[k] = match;
@@ -412,6 +414,17 @@ static int context_discover_update_sets_by_flag(Context *c, UpdateSetFlags flags
 
                         if (strv_contains(t->protected_versions, cursor))
                                 extra_flags |= UPDATE_PROTECTED;
+
+                        /* Partial or pending updates by definition are not incomplete, they’re
+                         * partial/pending instead. While an individual Instance cannot be both partial and
+                         * pending, an UpdateSet as a whole can contain both partial and pending instances. */
+                        assert(!match || !(match->is_partial && match->is_pending));
+
+                        if (match && match->is_partial)
+                                extra_flags = (extra_flags | UPDATE_PARTIAL) & ~UPDATE_INCOMPLETE;
+
+                        if (match && match->is_pending)
+                                extra_flags = (extra_flags | UPDATE_PENDING) & ~UPDATE_INCOMPLETE;
                 }
 
                 r = free_and_strdup_warn(&boundary, cursor);
@@ -430,7 +443,9 @@ static int context_discover_update_sets_by_flag(Context *c, UpdateSetFlags flags
 
                         /* Merge in what we've learned and continue onto the next version */
 
-                        if (FLAGS_SET(u->flags, UPDATE_INCOMPLETE)) {
+                        if (FLAGS_SET(u->flags, UPDATE_INCOMPLETE) ||
+                            FLAGS_SET(u->flags, UPDATE_PARTIAL) ||
+                            FLAGS_SET(u->flags, UPDATE_PENDING)) {
                                 assert(u->n_instances == c->n_transfers);
 
                                 /* Incomplete updates will have picked NULL instances for the transfers that
@@ -449,7 +464,7 @@ static int context_discover_update_sets_by_flag(Context *c, UpdateSetFlags flags
 
                         /* If this is the newest installed version, that is incomplete and just became marked
                          * as available, and if there is no other candidate available, we promote this to be
-                         * the candidate. */
+                         * the candidate. Ignore partial or pending status on the update set. */
                         if (FLAGS_SET(u->flags, UPDATE_NEWEST|UPDATE_INSTALLED|UPDATE_INCOMPLETE|UPDATE_AVAILABLE) &&
                             !c->candidate && !FLAGS_SET(u->flags, UPDATE_OBSOLETE))
                                 c->candidate = u;
@@ -485,7 +500,8 @@ static int context_discover_update_sets_by_flag(Context *c, UpdateSetFlags flags
                 if ((us->flags & (UPDATE_NEWEST|UPDATE_INSTALLED)) == (UPDATE_NEWEST|UPDATE_INSTALLED))
                         c->newest_installed = us;
 
-                /* Remember which is the newest non-obsolete, available (and not installed) version, which we declare the "candidate" */
+                /* Remember which is the newest non-obsolete, available (and not installed) version, which we declare the "candidate".
+                 * It may be partial or pending. */
                 if ((us->flags & (UPDATE_NEWEST|UPDATE_INSTALLED|UPDATE_AVAILABLE|UPDATE_OBSOLETE)) == (UPDATE_NEWEST|UPDATE_AVAILABLE))
                         c->candidate = us;
         }
@@ -494,6 +510,12 @@ static int context_discover_update_sets_by_flag(Context *c, UpdateSetFlags flags
         if (c->newest_installed && !FLAGS_SET(c->newest_installed->flags, UPDATE_INCOMPLETE) &&
             c->candidate && strverscmp_improved(c->newest_installed->version, c->candidate->version) >= 0)
                 c->candidate = NULL;
+
+        /* Newest installed is still pending or partial and no candidate is set? Then it becomes the candidate. */
+        if (c->newest_installed &&
+            (c->newest_installed->flags & (UPDATE_PENDING|UPDATE_PARTIAL)) &&
+            !c->candidate)
+                c->candidate = c->newest_installed;
 
         return 0;
 }
@@ -594,13 +616,14 @@ static int context_show_version(Context *c, const char *version) {
         if (!sd_json_format_enabled(arg_json_format_flags))
                 printf("%s%s%s Version: %s\n"
                        "    State: %s%s%s\n"
-                       "Installed: %s%s\n"
+                       "Installed: %s%s%s%s\n"
                        "Available: %s%s\n"
                        "Protected: %s%s%s\n"
                        " Obsolete: %s%s%s\n\n",
                        strempty(update_set_flags_to_color(us->flags)), update_set_flags_to_glyph(us->flags), ansi_normal(), us->version,
                        strempty(update_set_flags_to_color(us->flags)), update_set_flags_to_string(us->flags), ansi_normal(),
                        yes_no(us->flags & UPDATE_INSTALLED), FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_NEWEST) ? " (newest)" : "",
+                       FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PENDING) ? " (pending)" : "", FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PARTIAL) ? " (partial)" : "",
                        yes_no(us->flags & UPDATE_AVAILABLE), (us->flags & (UPDATE_INSTALLED|UPDATE_AVAILABLE|UPDATE_NEWEST)) == (UPDATE_AVAILABLE|UPDATE_NEWEST) ? " (newest)" : "",
                        FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PROTECTED) ? ansi_highlight() : "", yes_no(FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PROTECTED)), ansi_normal(),
                        us->flags & UPDATE_OBSOLETE ? ansi_highlight_red() : "", yes_no(us->flags & UPDATE_OBSOLETE), ansi_normal());
@@ -653,7 +676,7 @@ static int context_show_version(Context *c, const char *version) {
                 Instance *i = *inst;
 
                 if (!i) {
-                        assert(FLAGS_SET(us->flags, UPDATE_INCOMPLETE));
+                        assert(us->flags & (UPDATE_INCOMPLETE|UPDATE_PARTIAL|UPDATE_PENDING));
                         continue;
                 }
 
@@ -793,7 +816,7 @@ static int context_show_version(Context *c, const char *version) {
         if (!sd_json_format_enabled(arg_json_format_flags)) {
                 printf("%s%s%s Version: %s\n"
                        "    State: %s%s%s\n"
-                       "Installed: %s%s%s%s%s\n"
+                       "Installed: %s%s%s%s%s%s%s\n"
                        "Available: %s%s\n"
                        "Protected: %s%s%s\n"
                        " Obsolete: %s%s%s\n",
@@ -801,6 +824,7 @@ static int context_show_version(Context *c, const char *version) {
                        strempty(update_set_flags_to_color(us->flags)), update_set_flags_to_string(us->flags), ansi_normal(),
                        yes_no(us->flags & UPDATE_INSTALLED), FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_NEWEST) ? " (newest)" : "",
                        FLAGS_SET(us->flags, UPDATE_INCOMPLETE) ? ansi_highlight_yellow() : "", FLAGS_SET(us->flags, UPDATE_INCOMPLETE) ? " (incomplete)" : "", ansi_normal(),
+                       FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PENDING) ? " (pending)" : "", FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PARTIAL) ? " (partial)" : "",
                        yes_no(us->flags & UPDATE_AVAILABLE), (us->flags & (UPDATE_INSTALLED|UPDATE_AVAILABLE|UPDATE_NEWEST)) == (UPDATE_AVAILABLE|UPDATE_NEWEST) ? " (newest)" : "",
                        FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PROTECTED) ? ansi_highlight() : "", yes_no(FLAGS_SET(us->flags, UPDATE_INSTALLED|UPDATE_PROTECTED)), ansi_normal(),
                        us->flags & UPDATE_OBSOLETE ? ansi_highlight_red() : "", yes_no(us->flags & UPDATE_OBSOLETE), ansi_normal());
@@ -826,6 +850,8 @@ static int context_show_version(Context *c, const char *version) {
                                           SD_JSON_BUILD_PAIR_BOOLEAN("newest", FLAGS_SET(us->flags, UPDATE_NEWEST)),
                                           SD_JSON_BUILD_PAIR_BOOLEAN("available", FLAGS_SET(us->flags, UPDATE_AVAILABLE)),
                                           SD_JSON_BUILD_PAIR_BOOLEAN("installed", FLAGS_SET(us->flags, UPDATE_INSTALLED)),
+                                          SD_JSON_BUILD_PAIR_BOOLEAN("partial", FLAGS_SET(us->flags, UPDATE_PARTIAL)),
+                                          SD_JSON_BUILD_PAIR_BOOLEAN("pending", FLAGS_SET(us->flags, UPDATE_PENDING)),
                                           SD_JSON_BUILD_PAIR_BOOLEAN("obsolete", FLAGS_SET(us->flags, UPDATE_OBSOLETE)),
                                           SD_JSON_BUILD_PAIR_BOOLEAN("protected", FLAGS_SET(us->flags, UPDATE_PROTECTED)),
                                           SD_JSON_BUILD_PAIR_BOOLEAN("incomplete", FLAGS_SET(us->flags, UPDATE_INCOMPLETE)),
@@ -905,7 +931,7 @@ static int context_vacuum(
         return 0;
 }
 
-static int context_make_offline(Context **ret, const char *node, bool requires_enabled_transfers) {
+static int context_make_offline(Context **ret, const char *node, ReadDefinitionsFlags read_definitions_flags) {
         _cleanup_(context_freep) Context* context = NULL;
         int r;
 
@@ -918,7 +944,7 @@ static int context_make_offline(Context **ret, const char *node, bool requires_e
         if (!context)
                 return log_oom();
 
-        r = context_read_definitions(context, node, requires_enabled_transfers);
+        r = context_read_definitions(context, node, read_definitions_flags);
         if (r < 0)
                 return r;
 
@@ -939,7 +965,8 @@ static int context_make_online(Context **ret, const char *node) {
         /* Like context_make_offline(), but also communicates with the update source looking for new
          * versions (as long as --offline is not specified on the command line). */
 
-        r = context_make_offline(&context, node, /* requires_enabled_transfers= */ true);
+        r = context_make_offline(&context, node,
+                                 READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS | READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
         if (r < 0)
                 return r;
 
@@ -974,14 +1001,192 @@ static int context_on_acquire_progress(const Transfer *t, const Instance *inst, 
         assert(overall <= 100);
 
         log_debug("Transfer %zu/%zu is %u%% complete (%u%% overall).", i+1, n, percentage, overall);
-        return sd_notifyf(/* unset_environment=*/ false, "X_SYSUPDATE_PROGRESS=%u\n"
+        return sd_notifyf(/* unset_environment= */ false, "X_SYSUPDATE_PROGRESS=%u\n"
                                               "X_SYSUPDATE_TRANSFERS_LEFT=%zu\n"
                                               "X_SYSUPDATE_TRANSFERS_DONE=%zu\n"
                                               "STATUS=Updating to '%s' (%u%% complete).",
                                               overall, n - i, i, inst->metadata.version, overall);
 }
 
-static int context_apply(
+static int context_process_partial_and_pending(Context *c, const char *version);
+
+static int context_acquire(
+                Context *c,
+                const char *version) {
+
+        UpdateSet *us = NULL;
+        int r;
+
+        assert(c);
+
+        if (version) {
+                us = context_update_set_by_version(c, version);
+                if (!us)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Update '%s' not found.", version);
+        } else {
+                if (!c->candidate) {
+                        log_info("No update needed.");
+
+                        return 0;
+                }
+
+                us = c->candidate;
+        }
+
+        if (FLAGS_SET(us->flags, UPDATE_INCOMPLETE))
+                log_info("Selected update '%s' is already installed, but incomplete. Repairing.", us->version);
+        else if (FLAGS_SET(us->flags, UPDATE_PARTIAL)) {
+                return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN), "Selected update '%s' is already acquired and partially installed. Vacuum it to try installing again.", us->version);
+        } else if (FLAGS_SET(us->flags, UPDATE_PENDING)) {
+                log_info("Selected update '%s' is already acquired and pending installation.", us->version);
+
+                return context_process_partial_and_pending(c, version);
+        } else if (FLAGS_SET(us->flags, UPDATE_INSTALLED)) {
+                log_info("Selected update '%s' is already installed. Skipping update.", us->version);
+
+                return 0;
+        }
+
+        if (!FLAGS_SET(us->flags, UPDATE_AVAILABLE))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is not available, refusing.", us->version);
+        if (FLAGS_SET(us->flags, UPDATE_OBSOLETE))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is obsolete, refusing.", us->version);
+
+        if (!FLAGS_SET(us->flags, UPDATE_NEWEST))
+                log_notice("Selected update '%s' is not the newest, proceeding anyway.", us->version);
+        if (c->newest_installed && strverscmp_improved(c->newest_installed->version, us->version) > 0)
+                log_notice("Selected update '%s' is older than newest installed version, proceeding anyway.", us->version);
+
+        log_info("Selected update '%s' for install.", us->version);
+
+        _cleanup_free_ InstanceMetadata *metadata = new0(InstanceMetadata, c->n_transfers);
+        if (!metadata)
+                return log_oom();
+
+        /* Compute up the temporary paths before vacuuming so we don't vacuum anything if we fail to compute
+         * any paths because of failed validations (e.g. exceeding the gpt partition label size). */
+        for (size_t i = 0; i < c->n_transfers; i++) {
+                Instance *inst = us->instances[i];
+                Transfer *t = c->transfers[i];
+
+                assert(inst);
+
+                r = transfer_compute_temporary_paths(t, inst, metadata + i);
+                if (r < 0)
+                        return r;
+        }
+
+        (void) sd_notifyf(/* unset_environment= */ false,
+                          "READY=1\n"
+                          "X_SYSUPDATE_VERSION=%s\n"
+                          "STATUS=Making room for '%s'.", us->version, us->version);
+
+        /* Let's make some room. We make sure for each transfer we have one free space to fill. While
+         * removing stuff we'll protect the version we are trying to acquire. Why that? Maybe an earlier
+         * download succeeded already, in which case we shouldn't remove it just to acquire it again */
+        r = context_vacuum(
+                        c,
+                        /* space= */ 1,
+                        /* extra_protected_version= */ us->version);
+        if (r < 0)
+                return r;
+
+        if (arg_sync)
+                sync();
+
+        (void) sd_notifyf(/* unset_environment= */ false,
+                          "STATUS=Updating to '%s'.", us->version);
+
+        /* There should now be one instance picked for each transfer, and the order is the same */
+        assert(us->n_instances == c->n_transfers);
+
+        for (size_t i = 0; i < c->n_transfers; i++) {
+                Instance *inst = us->instances[i];
+                Transfer *t = c->transfers[i];
+
+                assert(inst); /* ditto */
+
+                if (inst->resource == &t->target) { /* a present transfer in an incomplete installation */
+                        assert(FLAGS_SET(us->flags, UPDATE_INCOMPLETE));
+                        continue;
+                }
+
+                r = transfer_acquire_instance(t, inst, metadata + i, context_on_acquire_progress, c);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_sync)
+                sync();
+
+        return 1;
+}
+
+/* Check to see if we have an update set acquired and pending installation. */
+static int context_process_partial_and_pending(
+                Context *c,
+                const char *version) {
+
+        UpdateSet *us = NULL;
+        int r;
+
+        assert(c);
+
+        if (version) {
+                us = context_update_set_by_version(c, version);
+                if (!us)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Update '%s' not found.", version);
+        } else {
+                if (!c->candidate) {
+                        log_info("No update needed.");
+
+                        return 0;
+                }
+
+                us = c->candidate;
+        }
+
+        if (FLAGS_SET(us->flags, UPDATE_INCOMPLETE))
+                log_info("Selected update '%s' is already installed, but incomplete. Repairing.", us->version);
+        else if ((us->flags & (UPDATE_PARTIAL|UPDATE_PENDING|UPDATE_INSTALLED)) == UPDATE_INSTALLED) {
+                log_info("Selected update '%s' is already installed. Skipping update.", us->version);
+
+                return 0;
+        }
+
+        if (FLAGS_SET(us->flags, UPDATE_PARTIAL))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is only partially downloaded, refusing.", us->version);
+        if (!FLAGS_SET(us->flags, UPDATE_PENDING))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is not pending installation, refusing.", us->version);
+
+        if (FLAGS_SET(us->flags, UPDATE_OBSOLETE))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is obsolete, refusing.", us->version);
+
+        if (!FLAGS_SET(us->flags, UPDATE_NEWEST))
+                log_notice("Selected update '%s' is not the newest, proceeding anyway.", us->version);
+        if (c->newest_installed && strverscmp_improved(c->newest_installed->version, us->version) > 0)
+                log_notice("Selected update '%s' is older than newest installed version, proceeding anyway.", us->version);
+
+        log_info("Selected update '%s' for install.", us->version);
+
+        /* There should now be one instance picked for each transfer, and the order is the same */
+        assert(us->n_instances == c->n_transfers);
+
+        for (size_t i = 0; i < c->n_transfers; i++) {
+                Instance *inst = us->instances[i];
+                Transfer *t = c->transfers[i];
+
+                assert(inst);
+
+                r = transfer_process_partial_and_pending_instance(t, inst);
+                if (r < 0)
+                        return r;
+        }
+
+        return 1;
+}
+
+static int context_install(
                 Context *c,
                 const char *version,
                 UpdateSet **ret_applied) {
@@ -999,89 +1204,23 @@ static int context_apply(
                 if (!c->candidate) {
                         log_info("No update needed.");
 
-                        if (ret_applied)
-                                *ret_applied = NULL;
-
                         return 0;
                 }
 
                 us = c->candidate;
         }
 
-        if (FLAGS_SET(us->flags, UPDATE_INCOMPLETE))
-                log_info("Selected update '%s' is already installed, but incomplete. Repairing.", us->version);
-        else if (FLAGS_SET(us->flags, UPDATE_INSTALLED)) {
-                log_info("Selected update '%s' is already installed. Skipping update.", us->version);
-
-                if (ret_applied)
-                        *ret_applied = NULL;
-
-                return 0;
-        }
-
-        if (!FLAGS_SET(us->flags, UPDATE_AVAILABLE))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is not available, refusing.", us->version);
-        if (FLAGS_SET(us->flags, UPDATE_OBSOLETE))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected update '%s' is obsolete, refusing.", us->version);
-
-        if (!FLAGS_SET(us->flags, UPDATE_NEWEST))
-                log_notice("Selected update '%s' is not the newest, proceeding anyway.", us->version);
-        if (c->newest_installed && strverscmp_improved(c->newest_installed->version, us->version) > 0)
-                log_notice("Selected update '%s' is older than newest installed version, proceeding anyway.", us->version);
-
-        log_info("Selected update '%s' for install.", us->version);
-
         (void) sd_notifyf(/* unset_environment=*/ false,
                           "READY=1\n"
                           "X_SYSUPDATE_VERSION=%s\n"
-                          "STATUS=Making room for '%s'.", us->version, us->version);
-
-        /* Let's make some room. We make sure for each transfer we have one free space to fill. While
-         * removing stuff we'll protect the version we are trying to acquire. Why that? Maybe an earlier
-         * download succeeded already, in which case we shouldn't remove it just to acquire it again */
-        r = context_vacuum(
-                        c,
-                        /* space = */ 1,
-                        /* extra_protected_version = */ us->version);
-        if (r < 0)
-                return r;
-
-        if (arg_sync)
-                sync();
-
-        (void) sd_notifyf(/* unset_environment=*/ false,
-                          "STATUS=Updating to '%s'.", us->version);
-
-        /* There should now be one instance picked for each transfer, and the order is the same */
-        assert(us->n_instances == c->n_transfers);
+                          "STATUS=Installing '%s'.", us->version, us->version);
 
         for (size_t i = 0; i < c->n_transfers; i++) {
                 Instance *inst = us->instances[i];
                 Transfer *t = c->transfers[i];
 
-                assert(inst); /* ditto */
-
-                if (inst->resource == &t->target) { /* a present transfer in an incomplete installation */
-                        assert(FLAGS_SET(us->flags, UPDATE_INCOMPLETE));
-                        continue;
-                }
-
-                r = transfer_acquire_instance(t, inst, context_on_acquire_progress, c);
-                if (r < 0)
-                        return r;
-        }
-
-        if (arg_sync)
-                sync();
-
-        (void) sd_notifyf(/* unset_environment=*/ false,
-                          "STATUS=Installing '%s'.", us->version);
-
-        for (size_t i = 0; i < c->n_transfers; i++) {
-                Instance *inst = us->instances[i];
-                Transfer *t = c->transfers[i];
-
-                if (inst->resource == &t->target)
+                if (inst->resource == &t->target &&
+                    !inst->is_pending)
                         continue;
 
                 r = transfer_install_instance(t, inst, arg_root);
@@ -1091,7 +1230,7 @@ static int context_apply(
 
         log_info("%s Successfully installed update '%s'.", glyph(GLYPH_SPARKLES), us->version);
 
-        (void) sd_notifyf(/* unset_environment=*/ false,
+        (void) sd_notifyf(/* unset_environment= */ false,
                           "STATUS=Installed '%s'.", us->version);
 
         if (ret_applied)
@@ -1145,7 +1284,9 @@ static int process_image(
         return 0;
 }
 
-static int verb_list(int argc, char **argv, void *userdata) {
+VERB(verb_list, "list", "[VERSION]", VERB_ANY, 2, VERB_DEFAULT,
+     "Show installed and available versions");
+static int verb_list(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         _cleanup_(context_freep) Context* context = NULL;
@@ -1172,13 +1313,16 @@ static int verb_list(int argc, char **argv, void *userdata) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
                 _cleanup_strv_free_ char **versions = NULL;
                 const char *current = NULL;
+                bool current_is_pending = false;
 
                 FOREACH_ARRAY(update_set, context->update_sets, context->n_update_sets) {
                         UpdateSet *us = *update_set;
 
                         if (FLAGS_SET(us->flags, UPDATE_INSTALLED) &&
-                            FLAGS_SET(us->flags, UPDATE_NEWEST))
+                            FLAGS_SET(us->flags, UPDATE_NEWEST)) {
                                 current = us->version;
+                                current_is_pending = FLAGS_SET(us->flags, UPDATE_PENDING);
+                        }
 
                         r = strv_extend(&versions, us->version);
                         if (r < 0)
@@ -1196,7 +1340,7 @@ static int verb_list(int argc, char **argv, void *userdata) {
                                         return log_oom();
                         }
 
-                r = sd_json_buildo(&json, SD_JSON_BUILD_PAIR_STRING("current", current),
+                r = sd_json_buildo(&json, SD_JSON_BUILD_PAIR_STRING(current_is_pending ? "current+pending" : "current", current),
                                           SD_JSON_BUILD_PAIR_STRV("all", versions),
                                           SD_JSON_BUILD_PAIR_STRV("appstreamUrls", appstream_urls));
                 if (r < 0)
@@ -1210,7 +1354,9 @@ static int verb_list(int argc, char **argv, void *userdata) {
         }
 }
 
-static int verb_features(int argc, char **argv, void *userdata) {
+VERB(verb_features, "features", "[FEATURE]", VERB_ANY, 2, 0,
+     "Show optional features");
+static int verb_features(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         _cleanup_(context_freep) Context* context = NULL;
@@ -1226,7 +1372,8 @@ static int verb_features(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return r;
 
-        r = context_make_offline(&context, loop_device ? loop_device->node : NULL, /* requires_enabled_transfers= */ false);
+        r = context_make_offline(&context, loop_device ? loop_device->node : NULL,
+                                 READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
         if (r < 0)
                 return r;
 
@@ -1344,7 +1491,9 @@ static int verb_features(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static int verb_check_new(int argc, char **argv, void *userdata) {
+VERB_NOARG(verb_check_new, "check-new",
+           "Check if there's a new version available");
+static int verb_check_new(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         _cleanup_(context_freep) Context* context = NULL;
@@ -1385,30 +1534,12 @@ static int verb_check_new(int argc, char **argv, void *userdata) {
         return EXIT_SUCCESS;
 }
 
-static int verb_vacuum(int argc, char **argv, void *userdata) {
-        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
-        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
-        _cleanup_(context_freep) Context* context = NULL;
-        int r;
+typedef enum {
+        UPDATE_ACTION_ACQUIRE = 1 << 0,
+        UPDATE_ACTION_INSTALL = 1 << 1,
+} UpdateActionFlags;
 
-        assert(argc <= 1);
-
-        if (arg_instances_max < 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                      "The --instances-max argument must be >= 1 while vacuuming");
-
-        r = process_image(/* ro= */ false, &mounted_dir, &loop_device);
-        if (r < 0)
-                return r;
-
-        r = context_make_offline(&context, loop_device ? loop_device->node : NULL, /* requires_enabled_transfers= */ false);
-        if (r < 0)
-                return r;
-
-        return context_vacuum(context, 0, NULL);
-}
-
-static int verb_update(int argc, char **argv, void *userdata) {
+static int verb_update_impl(int argc, char **argv, UpdateActionFlags action_flags) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         _cleanup_(context_freep) Context* context = NULL;
@@ -1442,7 +1573,15 @@ static int verb_update(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return r;
 
-        r = context_apply(context, version, &applied);
+        if (action_flags & UPDATE_ACTION_ACQUIRE)
+                r = context_acquire(context, version);
+        else
+                r = context_process_partial_and_pending(context, version);
+        if (r < 0)
+                return r;  /* error */
+
+        if (action_flags & UPDATE_ACTION_INSTALL && r > 0)  /* update needed */
+                r = context_install(context, version, &applied);
         if (r < 0)
                 return r;
 
@@ -1467,7 +1606,54 @@ static int verb_update(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static int verb_pending_or_reboot(int argc, char **argv, void *userdata) {
+VERB(verb_update, "update", "[VERSION]", VERB_ANY, 2, 0,
+     "Install new version now");
+static int verb_update(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        UpdateActionFlags flags = UPDATE_ACTION_INSTALL;
+
+        if (!arg_offline)
+                flags |= UPDATE_ACTION_ACQUIRE;
+
+        return verb_update_impl(argc, argv, flags);
+}
+
+VERB(verb_acquire, "acquire", "[VERSION]", VERB_ANY, 2, 0,
+     "Acquire (download) new version now");
+static int verb_acquire(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return verb_update_impl(argc, argv, UPDATE_ACTION_ACQUIRE);
+}
+
+VERB_NOARG(verb_vacuum, "vacuum",
+           "Make room, by deleting old versions");
+static int verb_vacuum(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
+        _cleanup_(context_freep) Context* context = NULL;
+        int r;
+
+        assert(argc <= 1);
+
+        if (arg_instances_max < 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                      "The --instances-max argument must be >= 1 while vacuuming");
+
+        r = process_image(/* ro= */ false, &mounted_dir, &loop_device);
+        if (r < 0)
+                return r;
+
+        r = context_make_offline(&context, loop_device ? loop_device->node : NULL,
+                                 READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
+        if (r < 0)
+                return r;
+
+        return context_vacuum(context, 0, NULL);
+}
+
+VERB(verb_pending_or_reboot, "pending", NULL, 1, 1, 0,
+     "Report whether a newer version is installed than currently booted");
+VERB(verb_pending_or_reboot, "reboot", NULL, 1, 1, 0,
+     "Reboot if a newer version is installed than booted");
+static int verb_pending_or_reboot(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(context_freep) Context* context = NULL;
         _cleanup_free_ char *booted_version = NULL;
         int r;
@@ -1478,7 +1664,8 @@ static int verb_pending_or_reboot(int argc, char **argv, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "The --root=/--image= switches may not be combined with the '%s' operation.", argv[0]);
 
-        r = context_make_offline(&context, /* node= */ NULL, /* requires_enabled_transfers= */ true);
+        r = context_make_offline(&context, /* node= */ NULL,
+                                 READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS | READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
         if (r < 0)
                 return r;
 
@@ -1541,7 +1728,10 @@ static int component_name_valid(const char *c) {
         return filename_is_valid(j);
 }
 
-static int verb_components(int argc, char **argv, void *userdata) {
+VERB_NOARG(verb_components, "components",
+           "Show list of components");
+static int verb_components(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(context_freep) Context* context = NULL;
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         _cleanup_set_free_ Set *names = NULL;
@@ -1554,24 +1744,28 @@ static int verb_components(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return r;
 
+        r = context_make_offline(&context, loop_device ? loop_device->node : NULL, 0);
+        if (r < 0)
+                return r;
+
         ConfFile **directories = NULL;
         size_t n_directories = 0;
 
-        CLEANUP_ARRAY(directories, n_directories, conf_file_free_many);
+        CLEANUP_ARRAY(directories, n_directories, conf_file_free_array);
 
-        r = conf_files_list_strv_full(".d", arg_root, CONF_FILES_DIRECTORY, (const char * const *) CONF_PATHS_STRV(""), &directories, &n_directories);
+        r = conf_files_list_strv_full(".d", arg_root, CONF_FILES_DIRECTORY|CONF_FILES_WARN,
+                                      (const char * const *) CONF_PATHS_STRV(""), &directories, &n_directories);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate directories: %m");
 
         FOREACH_ARRAY(i, directories, n_directories) {
                 ConfFile *e = *i;
 
-                if (streq(e->name, "sysupdate.d")) {
-                        has_default_component = true;
+                if (streq(e->filename, "sysupdate.d")) {
                         continue;
                 }
 
-                const char *s = startswith(e->name, "sysupdate.");
+                const char *s = startswith(e->filename, "sysupdate.");
                 if (!s)
                         continue;
 
@@ -1594,6 +1788,14 @@ static int verb_components(int argc, char **argv, void *userdata) {
                         return log_error_errno(r, "Failed to add component '%s' to set: %m", n);
                 TAKE_PTR(n);
         }
+
+        /* Does the system have at least one transfer file in /etc/sysupdate.d, which can be considered a
+         * TARGET_HOST? See target_get_argument() in sysupdated.c */
+        has_default_component = (!arg_definitions &&
+                                 !arg_component &&
+                                 !arg_root &&
+                                 !arg_image &&
+                                 context->n_transfers > 0);
 
         /* We use simple free() rather than strv_free() here, since set_free() will free the strings for us */
         _cleanup_free_ char **z = set_get_strv(names);
@@ -1630,188 +1832,150 @@ static int verb_components(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static int verb_help(int argc, char **argv, void *userdata) {
+static int help(void) {
         _cleanup_free_ char *link = NULL;
+        _cleanup_(table_unrefp) Table *common_options = NULL, *options = NULL, *verbs = NULL;
         int r;
 
         r = terminal_urlify_man("systemd-sysupdate", "8", &link);
         if (r < 0)
                 return log_oom();
 
-        printf("%1$s [OPTIONS...] [VERSION]\n"
-               "\n%5$sUpdate OS images.%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  list [VERSION]          Show installed and available versions\n"
-               "  features [FEATURE]      Show optional features\n"
-               "  check-new               Check if there's a new version available\n"
-               "  update [VERSION]        Install new version now\n"
-               "  vacuum                  Make room, by deleting old versions\n"
-               "  pending                 Report whether a newer version is installed than\n"
-               "                          currently booted\n"
-               "  reboot                  Reboot if a newer version is installed than booted\n"
-               "  components              Show list of components\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -C --component=NAME     Select component to update\n"
-               "     --definitions=DIR    Find transfer definitions in specified directory\n"
-               "     --root=PATH          Operate on an alternate filesystem root\n"
-               "     --image=PATH         Operate on disk image as filesystem root\n"
-               "     --image-policy=POLICY\n"
-               "                          Specify disk image dissection policy\n"
-               "  -m --instances-max=INT  How many instances to maintain\n"
-               "     --sync=BOOL          Controls whether to sync data to disk\n"
-               "     --verify=BOOL        Force signature verification on or off\n"
-               "     --reboot             Reboot after updating to newer version\n"
-               "     --offline            Do not fetch metadata from the network\n"
-               "     --no-pager           Do not pipe output into a pager\n"
-               "     --no-legend          Do not show the headers and footers\n"
-               "     --json=pretty|short|off\n"
-               "                          Generate JSON output\n"
-               "     --transfer-source=PATH\n"
-               "                          Specify the directory to transfer sources from\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
+        r = verbs_get_help_table(&verbs);
+        if (r < 0)
+                return r;
 
+        r = option_parser_get_help_table(&common_options);
+        if (r < 0)
+                return r;
+
+        r = option_parser_get_help_table_group("Options", &options);
+        if (r < 0)
+                return r;
+
+        (void) table_sync_column_widths(0, verbs, common_options, options);
+
+        printf("%s [OPTIONS...] [VERSION]\n"
+               "\n%sUpdate OS images.%s\n"
+               "\n%sCommands:%s\n",
+               program_invocation_short_name,
+               ansi_highlight(), ansi_normal(),
+               ansi_underline(), ansi_normal());
+
+        r = table_print_or_warn(verbs);
+        if (r < 0)
+                return r;
+
+        r = table_print_or_warn(common_options);
+        if (r < 0)
+                return r;
+
+        printf("\n%sOptions:%s\n", ansi_underline(), ansi_normal());
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
+
+        printf("\nSee the %s for details.\n", link);
         return 0;
 }
 
-static int parse_argv(int argc, char *argv[]) {
+VERB_COMMON_HELP_HIDDEN(help);
 
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_NO_LEGEND,
-                ARG_SYNC,
-                ARG_DEFINITIONS,
-                ARG_JSON,
-                ARG_ROOT,
-                ARG_IMAGE,
-                ARG_IMAGE_POLICY,
-                ARG_REBOOT,
-                ARG_VERIFY,
-                ARG_OFFLINE,
-                ARG_TRANSFER_SOURCE,
-        };
-
-        static const struct option options[] = {
-                { "help",              no_argument,       NULL, 'h'                   },
-                { "version",           no_argument,       NULL, ARG_VERSION           },
-                { "no-pager",          no_argument,       NULL, ARG_NO_PAGER          },
-                { "no-legend",         no_argument,       NULL, ARG_NO_LEGEND         },
-                { "definitions",       required_argument, NULL, ARG_DEFINITIONS       },
-                { "instances-max",     required_argument, NULL, 'm'                   },
-                { "sync",              required_argument, NULL, ARG_SYNC              },
-                { "json",              required_argument, NULL, ARG_JSON              },
-                { "root",              required_argument, NULL, ARG_ROOT              },
-                { "image",             required_argument, NULL, ARG_IMAGE             },
-                { "image-policy",      required_argument, NULL, ARG_IMAGE_POLICY      },
-                { "reboot",            no_argument,       NULL, ARG_REBOOT            },
-                { "component",         required_argument, NULL, 'C'                   },
-                { "verify",            required_argument, NULL, ARG_VERIFY            },
-                { "offline",           no_argument,       NULL, ARG_OFFLINE           },
-                { "transfer-source",   required_argument, NULL, ARG_TRANSFER_SOURCE   },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        while ((c = getopt_long(argc, argv, "hm:C:", options, NULL)) >= 0) {
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return verb_help(0, NULL, NULL);
+                OPTION_COMMON_HELP:
+                        return help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
-                        arg_pager_flags |= PAGER_DISABLE;
+                OPTION_GROUP("Options"):
                         break;
 
-                case ARG_NO_LEGEND:
-                        arg_legend = false;
-                        break;
-
-                case 'm':
-                        r = safe_atou64(optarg, &arg_instances_max);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --instances-max= parameter: %s", optarg);
-
-                        break;
-
-                case ARG_SYNC:
-                        r = parse_boolean_argument("--sync=", optarg, &arg_sync);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_DEFINITIONS:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_definitions);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
-                        if (r <= 0)
-                                return r;
-
-                        break;
-
-                case ARG_ROOT:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_root);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_IMAGE:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_image);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_IMAGE_POLICY:
-                        r = parse_image_policy_argument(optarg, &arg_image_policy);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_REBOOT:
-                        arg_reboot = true;
-                        break;
-
-                case 'C':
-                        if (isempty(optarg)) {
+                OPTION('C', "component", "NAME",
+                       "Select component to update"):
+                        if (isempty(opts.arg)) {
                                 arg_component = mfree(arg_component);
                                 break;
                         }
 
-                        r = component_name_valid(optarg);
+                        r = component_name_valid(opts.arg);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to determine if component name is valid: %m");
                         if (r == 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Component name invalid: %s", optarg);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Component name invalid: %s", opts.arg);
 
-                        r = free_and_strdup_warn(&arg_component, optarg);
+                        r = free_and_strdup_warn(&arg_component, opts.arg);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_VERIFY: {
+                OPTION_LONG("definitions", "DIR",
+                            "Find transfer definitions in specified directory"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_definitions);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("root", "PATH",
+                            "Operate on an alternate filesystem root"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("image", "PATH",
+                            "Operate on disk image as filesystem root"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("image-policy", "POLICY",
+                            "Specify disk image dissection policy"):
+                        r = parse_image_policy_argument(opts.arg, &arg_image_policy);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("transfer-source", "PATH",
+                            "Specify the directory to transfer sources from"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_transfer_source);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                OPTION('m', "instances-max", "INT",
+                       "How many instances to maintain"):
+                        r = safe_atou64(opts.arg, &arg_instances_max);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --instances-max= parameter: %s", opts.arg);
+
+                        break;
+
+                OPTION_LONG("sync", "BOOL",
+                            "Controls whether to sync data to disk"):
+                        r = parse_boolean_argument("--sync=", opts.arg, &arg_sync);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("verify", "BOOL",
+                            "Force signature verification on or off"): {
                         bool b;
 
-                        r = parse_boolean_argument("--verify=", optarg, &b);
+                        r = parse_boolean_argument("--verify=", opts.arg, &b);
                         if (r < 0)
                                 return r;
 
@@ -1819,24 +1983,31 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_OFFLINE:
+                OPTION_LONG("reboot", NULL,
+                            "Reboot after updating to newer version"):
+                        arg_reboot = true;
+                        break;
+
+                OPTION_LONG("offline", NULL,
+                            "Do not fetch metadata from the network"):
                         arg_offline = true;
                         break;
 
-                case ARG_TRANSFER_SOURCE:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_transfer_source);
-                        if (r < 0)
+                OPTION_COMMON_NO_PAGER:
+                        arg_pager_flags |= PAGER_DISABLE;
+                        break;
+
+                OPTION_COMMON_NO_LEGEND:
+                        arg_legend = false;
+                        break;
+
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
+                        if (r <= 0)
                                 return r;
 
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
-        }
 
         if (arg_image && arg_root)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
@@ -1847,25 +2018,8 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_definitions && arg_component)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --definitions= and --component= switches may not be combined.");
 
+        *remaining_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int sysupdate_main(int argc, char *argv[]) {
-
-        static const Verb verbs[] = {
-                { "list",       VERB_ANY, 2, VERB_DEFAULT, verb_list              },
-                { "components", VERB_ANY, 1, 0,            verb_components        },
-                { "features",   VERB_ANY, 2, 0,            verb_features          },
-                { "check-new",  VERB_ANY, 1, 0,            verb_check_new         },
-                { "update",     VERB_ANY, 2, 0,            verb_update            },
-                { "vacuum",     VERB_ANY, 1, 0,            verb_vacuum            },
-                { "reboot",     1,        1, 0,            verb_pending_or_reboot },
-                { "pending",    1,        1, 0,            verb_pending_or_reboot },
-                { "help",       VERB_ANY, 1, 0,            verb_help              },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
 }
 
 static int run(int argc, char *argv[]) {
@@ -1873,14 +2027,12 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        /* SIGCHLD signal must be blocked for sd_event_add_child to work */
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
-
-        return sysupdate_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

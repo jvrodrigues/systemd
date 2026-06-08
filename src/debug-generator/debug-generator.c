@@ -101,7 +101,8 @@ static int parse_breakpoint_from_string(const char *s, uint32_t *ret_breakpoints
 
                 FOREACH_ELEMENT(i, breakpoint_info_table)
                         if (FLAGS_SET(i->validity, BREAKPOINT_DEFAULT) && breakpoint_applies(i, INT_MAX)) {
-                                breakpoints |= 1 << i->type;
+                                assert(i->type >= 0 && i->type < _BREAKPOINT_TYPE_MAX); /* silence coverity */
+                                breakpoints |= UINT32_C(1) << i->type;
                                 found_default = true;
                                 break;
                         }
@@ -127,7 +128,7 @@ static int parse_breakpoint_from_string(const char *s, uint32_t *ret_breakpoints
                         }
 
                         if (breakpoint_applies(&breakpoint_info_table[tt], LOG_WARNING))
-                                breakpoints |= 1 << tt;
+                                breakpoints |= UINT32_C(1) << tt;
                 }
 
         *ret_breakpoints = breakpoints;
@@ -347,7 +348,7 @@ static int process_unit_credentials(const char *credentials_dir) {
                                 continue;
                         }
 
-                        r = write_drop_in(arg_dest, dropin_unit, /* level = */ UINT_MAX, dropin_name, d);
+                        r = write_drop_in(arg_dest, dropin_unit, /* level= */ UINT_MAX, dropin_name, d);
                         if (r < 0) {
                                 log_warning_errno(r, "Failed to write drop-in '%s' for unit '%s' from credential '%s', ignoring: %m",
                                                   dropin_name, dropin_unit, de->d_name);

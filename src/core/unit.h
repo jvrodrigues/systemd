@@ -10,6 +10,7 @@
 #include "install.h"
 #include "iterator.h"
 #include "job.h"
+#include "journal-def.h"
 #include "list.h"
 #include "log.h"
 #include "log-context.h"
@@ -288,6 +289,10 @@ typedef struct Unit {
 
         /* References to this unit from clients */
         sd_bus_track *bus_track;
+
+        /* If non-NULL, a varlink connection streaming unit state change notifications */
+        sd_varlink *varlink_unit_change;
+
         char **deserialized_refs;
 
         /* References to this */
@@ -613,6 +618,13 @@ typedef struct UnitVTable {
         /* Try to match up fds with what we need for this unit */
         void (*distribute_fds)(Unit *u, FDSet *fds);
 
+        /* Restore one file descriptor that PID 1 retrieved from a Live Update Orchestrator session into the
+         * unit's per-instance state (e.g. fd store). Always consumes 'fd', even on failure. If the fd
+         * was previously propagated to an upstream NOTIFY_SOCKET supervisor under a numeric index,
+         * 'index' carries that index so it can be re-claimed (avoiding collisions with newly allocated
+         * indices and keeping FDSTOREREMOVE messages routable). Pass 0 to indicate no preserved index. */
+        int (*attach_external_fd_to_fdstore)(Unit *u, int fd, const char *fdname, uint64_t index);
+
         /* Boils down the more complex internal state of this unit to
          * a simpler one that the engine can understand */
         UnitActiveState (*active_state)(Unit *u);
@@ -765,6 +777,10 @@ typedef struct UnitVTable {
 
         /* If true, we'll notify a surrounding VMM/container manager about this unit becoming available */
         bool notify_supervisor;
+
+        /* If true, we'll synthesize an 'orphaned' unit if a unit becomes an alias of another unit during a
+         * reload cycle, but still has resources assigned to it */
+        bool track_orphaned;
 
         /* The audit events to generate on start + stop (or 0 if none shall be generated) */
         int audit_start_message_type;
@@ -972,6 +988,7 @@ int unit_write_settingf(Unit *u, UnitWriteFlags flags, const char *name, const c
 int unit_kill_context(Unit *u, KillOperation k);
 
 int unit_make_transient(Unit *u);
+int manager_setup_transient_unit(Manager *m, const char *name, Unit **ret, sd_bus_error *reterr_error);
 
 int unit_add_mounts_for(Unit *u, const char *path, UnitDependencyMask mask, UnitMountDependencyType type);
 
@@ -1005,6 +1022,7 @@ int unit_acquire_invocation_id(Unit *u);
 
 int unit_set_exec_params(Unit *u, ExecParameters *p);
 
+int unit_fork_helper_process_full(Unit *u, const char *name, bool into_cgroup, ForkFlags flags, PidRef *ret);
 int unit_fork_helper_process(Unit *u, const char *name, bool into_cgroup, PidRef *ret);
 int unit_fork_and_watch_rm_rf(Unit *u, char **paths, PidRef *ret);
 
@@ -1086,12 +1104,20 @@ int unit_compare_priority(Unit *a, Unit *b);
 const char* unit_log_field(const Unit *u);
 const char* unit_invocation_log_field(const Unit *u);
 
-UnitMountDependencyType unit_mount_dependency_type_from_string(const char *s) _const_;
-const char* unit_mount_dependency_type_to_string(UnitMountDependencyType t) _const_;
+DECLARE_STRING_TABLE_LOOKUP(unit_mount_dependency_type, UnitMountDependencyType);
 UnitDependency unit_mount_dependency_type_to_dependency_type(UnitMountDependencyType t) _pure_;
 
-const char* oom_policy_to_string(OOMPolicy i) _const_;
-OOMPolicy oom_policy_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(oom_policy, OOMPolicy);
+
+int unit_queue_job_check_and_mangle_type(Unit *u, JobType *type, bool reload_if_possible, sd_bus_error *reterr_error);
+
+int parse_unit_marker(const char *marker, unsigned *settings, unsigned *mask);
+unsigned unit_normalize_markers(unsigned existing_markers, unsigned new_markers);
+
+/* Trying to log with too many fields is going to fail. We need at least also MESSAGE=,
+ * but we generally log a few extra in most cases. So let's reserve 10. Anything
+ * above a few would be very unusual, but let's not be overly strict. */
+#define LOG_EXTRA_FIELDS_MAX (ENTRY_FIELD_COUNT_MAX - 10)
 
 /* Macros which append UNIT= or USER_UNIT= to the message */
 
@@ -1167,8 +1193,7 @@ OOMPolicy oom_policy_from_string(const char *s) _pure_;
 #define LOG_UNIT_ID(unit) LOG_ITEM("%s%s", unit_log_field((unit)), (unit)->id)
 #define LOG_UNIT_INVOCATION_ID(unit) LOG_ITEM("%s%s", unit_invocation_log_field((unit)), (unit)->invocation_id_string)
 
-const char* collect_mode_to_string(CollectMode m) _const_;
-CollectMode collect_mode_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(collect_mode, CollectMode);
 
 typedef struct UnitForEachDependencyData {
         /* Stores state for the FOREACH macro below for iterating through all deps that have any of the

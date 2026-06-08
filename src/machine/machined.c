@@ -23,9 +23,10 @@
 #include "hostname-util.h"
 #include "machine.h"
 #include "machined.h"
+#include "machined-dbus.h"
 #include "machined-varlink.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "operation.h"
 #include "path-lookup.h"
 #include "service-util.h"
@@ -365,8 +366,6 @@ static int run(int argc, char *argv[]) {
          * make sure this check stays in. */
         if (scope == RUNTIME_SCOPE_SYSTEM)
                 (void) mkdir_label("/run/systemd/machines", 0755);
-
-        assert_se(sigprocmask_many(SIG_BLOCK, /* ret_old_mask= */ NULL, SIGCHLD) >= 0);
 
         r = manager_new(scope, &m);
         if (r < 0)

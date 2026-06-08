@@ -2019,16 +2019,18 @@ Ports=eth2</programlisting>
       </varlistentry>
       <varlistentry>
         <term><varname>User=</varname></term>
-        <listitem><para>User to grant access to the <filename>/dev/net/tun</filename> device. The specified
-        user must be a system user.</para>
+        <listitem><para>User to grant access to the <filename>/dev/net/tun</filename> device.
+        Note that the user must be resolvable during early boot. Using non-system users
+        is deprecated.</para>
 
         <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
       </varlistentry>
       <varlistentry>
         <term><varname>Group=</varname></term>
-        <listitem><para>Group to grant access to the <filename>/dev/net/tun</filename> device. The specified
-        group must be a system group.</para>
+        <listitem><para>Group to grant access to the <filename>/dev/net/tun</filename> device.
+        Note that the group must be resolvable during early boot. Using non-system groups
+        is deprecated.</para>
 
         <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
@@ -2681,7 +2683,10 @@ Ports=eth2</programlisting>
       <varlistentry>
         <term><varname>Table=</varname></term>
         <listitem>
-          <para>The numeric routing table identifier. This setting is compulsory.</para>
+          <para>The routing table identifier. Takes a route table name or number. Route table names
+          may be predefined or configured with <varname>RouteTable=</varname> in
+          <citerefentry><refentrytitle>networkd.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+          This setting is compulsory.</para>
 
         <xi:include href="version-info.xml" xpointer="v243"/>
         </listitem>

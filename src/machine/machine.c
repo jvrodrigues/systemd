@@ -26,7 +26,7 @@
 #include "machine-dbus.h"
 #include "machined-resolve-hook.h"
 #include "machined.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "namespace-util.h"
 #include "operation.h"
 #include "parse-util.h"
@@ -154,6 +154,7 @@ Machine* machine_free(Machine *m) {
         free(m->netif);
         free(m->ssh_address);
         free(m->ssh_private_key_path);
+        free(m->control_address);
 
         return mfree(m);
 }
@@ -176,7 +177,7 @@ int machine_save(Machine *m) {
                         return log_oom();
         }
 
-        r = mkdir_safe_label(m->manager->state_dir, 0755, 0, 0, MKDIR_WARN_MODE);
+        r = mkdir_safe_label(m->manager->state_dir, 0755, UID_INVALID, GID_INVALID, MKDIR_WARN_MODE);
         if (r < 0)
                 return log_error_errno(r, "Failed to create '%s': %m", m->manager->state_dir);
 
@@ -245,6 +246,7 @@ int machine_save(Machine *m) {
 
         env_file_fputs_assignment(f, "SSH_ADDRESS=", m->ssh_address);
         env_file_fputs_assignment(f, "SSH_PRIVATE_KEY_PATH=", m->ssh_private_key_path);
+        env_file_fputs_assignment(f, "CONTROL_ADDRESS=", m->control_address);
 
         r = flink_tmpfile(f, temp_path, m->state_file, LINK_TMPFILE_REPLACE);
         if (r < 0)
@@ -338,6 +340,7 @@ int machine_load(Machine *m) {
                            "VSOCK_CID",            &vsock_cid,
                            "SSH_ADDRESS",          &m->ssh_address,
                            "SSH_PRIVATE_KEY_PATH", &m->ssh_private_key_path,
+                           "CONTROL_ADDRESS",      &m->control_address,
                            "UID",                  &uid);
         if (r == -ENOENT)
                 return 0;
@@ -509,7 +512,7 @@ static int machine_start_scope(
                  * doesn't support PIDFDs yet, let's try without. */
                 if (allow_pidfd &&
                     sd_bus_error_has_names(&e, SD_BUS_ERROR_UNKNOWN_PROPERTY, SD_BUS_ERROR_PROPERTY_READ_ONLY))
-                        return machine_start_scope(machine, /* allow_pidfd = */ false, more_properties, error);
+                        return machine_start_scope(machine, /* allow_pidfd= */ false, more_properties, error);
 
                 return sd_bus_error_move(error, &e);
         }
@@ -532,7 +535,7 @@ static int machine_ensure_scope(Machine *m, sd_bus_message *properties, sd_bus_e
         assert(m->class != MACHINE_HOST);
 
         if (!m->unit) {
-                r = machine_start_scope(m, /* allow_pidfd = */ true, properties, error);
+                r = machine_start_scope(m, /* allow_pidfd= */ true, properties, error);
                 if (r < 0)
                         return log_error_errno(r, "Failed to start machine scope: %s", bus_error_message(error, r));
         }
@@ -928,7 +931,7 @@ int machine_start_getty(Machine *m, const char *ptmx_name, sd_bus_error *error) 
         container_bus = allocated_bus ?: m->manager->system_bus;
         getty = strjoina("container-getty@", p, ".service");
 
-        r = bus_call_method(container_bus, bus_systemd_mgr, "StartUnit", error, /* ret_reply = */ NULL, "ss", getty, "replace");
+        r = bus_call_method(container_bus, bus_systemd_mgr, "StartUnit", error, /* ret_reply= */ NULL, "ss", getty, "replace");
         if (r < 0)
                 return log_debug_errno(r, "Failed to StartUnit '%s' in container '%s': %m", getty, m->name);
 
@@ -1103,11 +1106,10 @@ int machine_start_shell(
 
 char** machine_default_shell_args(const char *user) {
         _cleanup_strv_free_ char **args = NULL;
-        int r;
 
         assert(user);
 
-        args = new0(char*, 3 + 1);
+        args = new0(char*, 5 + 1);
         if (!args)
                 return NULL;
 
@@ -1119,14 +1121,19 @@ char** machine_default_shell_args(const char *user) {
         if (!args[1])
                 return NULL;
 
-        r = asprintf(&args[2],
-                     "shell=$(getent passwd %s 2>/dev/null | { IFS=: read _ _ _ _ _ _ x; echo \"$x\"; })\n"\
-                     "exec \"${shell:-/bin/sh}\" -l", /* -l is means --login */
-                     user);
-        if (r < 0) {
-                args[2] = NULL;
+        args[2] = strdup(
+                     "shell=$(getent passwd \"$1\" 2>/dev/null | { IFS=: read _ _ _ _ _ _ x; echo \"$x\"; })\n"
+                     "exec \"${shell:-/bin/sh}\" -l"); /* -l means --login */
+        if (!args[2])
                 return NULL;
-        }
+
+        args[3] = strdup("sh"); /* $0 placeholder for sh -c */
+        if (!args[3])
+                return NULL;
+
+        args[4] = strdup(user); /* becomes $1 in the script */
+        if (!args[4])
+                return NULL;
 
         return TAKE_PTR(args);
 }
@@ -1141,9 +1148,9 @@ int machine_copy_from_to_operation(
                 Operation **ret) {
 
         _cleanup_close_ int host_fd = -EBADF, target_mntns_fd = -EBADF, source_mntns_fd = -EBADF;
+        _cleanup_(pidref_done_sigkill_wait) PidRef child = PIDREF_NULL;
         _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
         _cleanup_free_ char *host_basename = NULL, *container_basename = NULL;
-        _cleanup_(sigkill_waitp) pid_t child = 0;
         uid_t uid_shift;
         int r;
 
@@ -1183,14 +1190,12 @@ int machine_copy_from_to_operation(
 
         r = namespace_fork("(sd-copyns)",
                            "(sd-copy)",
-                           /* except_fds = */ NULL,
-                           /* n_except_fds = */ 0,
                            FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
-                           /* pidns_fd = */ -EBADF,
+                           /* pidns_fd= */ -EBADF,
                            target_mntns_fd,
-                           /* netns_fd = */ -EBADF,
-                           /* userns_fd = */ -EBADF,
-                           /* root_fd = */ -EBADF,
+                           /* netns_fd= */ -EBADF,
+                           /* userns_fd= */ -EBADF,
+                           /* root_fd= */ -EBADF,
                            &child);
         if (r < 0)
                 return log_debug_errno(r, "Failed to fork into mount namespace of machine '%s': %m", machine->name);
@@ -1223,8 +1228,8 @@ int machine_copy_from_to_operation(
                                         uid_shift == 0 ? UID_INVALID : 0,
                                         uid_shift == 0 ? GID_INVALID : 0,
                                         copy_flags,
-                                        /* denylist = */ NULL,
-                                        /* subvolumes = */ NULL);
+                                        /* denylist= */ NULL,
+                                        /* subvolumes= */ NULL);
                 else
                         r = copy_tree_at(
                                         host_fd,
@@ -1234,8 +1239,8 @@ int machine_copy_from_to_operation(
                                         uid_shift == 0 ? UID_INVALID : uid_shift,
                                         uid_shift == 0 ? GID_INVALID : uid_shift,
                                         copy_flags,
-                                        /* denylist = */ NULL,
-                                        /* subvolumes = */ NULL);
+                                        /* denylist= */ NULL,
+                                        /* subvolumes= */ NULL);
                 if (r < 0)
                         log_debug_errno(r, "Failed to copy tree: %m");
 
@@ -1245,12 +1250,12 @@ int machine_copy_from_to_operation(
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
         Operation *operation;
-        r = operation_new(manager, machine, child, errno_pipe_fd[0], &operation);
+        r = operation_new(manager, machine, &child, errno_pipe_fd[0], &operation);
         if (r < 0)
                 return r;
 
         TAKE_FD(errno_pipe_fd[0]);
-        TAKE_PID(child);
+        TAKE_PIDREF(child);
 
         *ret = operation;
         return 0;
@@ -1532,14 +1537,14 @@ int machine_open_root_directory(Machine *machine) {
 
         case MACHINE_CONTAINER: {
                 _cleanup_close_ int mntns_fd = -EBADF, root_fd = -EBADF;
+                _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
                 _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR, fd_pass_socket[2] = EBADF_PAIR;
-                pid_t child;
 
                 r = pidref_namespace_open(&machine->leader,
-                                          /* ret_pidns_fd = */ NULL,
+                                          /* ret_pidns_fd= */ NULL,
                                           &mntns_fd,
-                                          /* ret_netns_fd = */ NULL,
-                                          /* ret_userns_fd = */ NULL,
+                                          /* ret_netns_fd= */ NULL,
+                                          /* ret_userns_fd= */ NULL,
                                           &root_fd);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to open mount namespace of machine '%s': %m", machine->name);
@@ -1553,13 +1558,11 @@ int machine_open_root_directory(Machine *machine) {
                 r = namespace_fork(
                                 "(sd-openrootns)",
                                 "(sd-openroot)",
-                                /* except_fds = */ NULL,
-                                /* n_except_fds = */ 0,
                                 FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
-                                /* pidns_fd = */  -EBADF,
+                                /* pidns_fd= */  -EBADF,
                                 mntns_fd,
-                                /* netns_fd = */  -EBADF,
-                                /* userns_fd = */ -EBADF,
+                                /* netns_fd= */  -EBADF,
+                                /* userns_fd= */ -EBADF,
                                 root_fd,
                                 &child);
                 if (r < 0)
@@ -1576,7 +1579,7 @@ int machine_open_root_directory(Machine *machine) {
                                 report_errno_and_exit(errno_pipe_fd[1], -errno);
                         }
 
-                        r = send_one_fd(fd_pass_socket[1], dfd, /* flags = */ 0);
+                        r = send_one_fd(fd_pass_socket[1], dfd, /* flags= */ 0);
                         dfd = safe_close(dfd);
                         if (r < 0) {
                                 log_debug_errno(r, "Failed to send FD over socket: %m");
@@ -1589,7 +1592,7 @@ int machine_open_root_directory(Machine *machine) {
                 errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
                 fd_pass_socket[1] = safe_close(fd_pass_socket[1]);
 
-                r = wait_for_terminate_and_check("(sd-openrootns)", child, /* flags = */ 0);
+                r = pidref_wait_for_terminate_and_check("(sd-openrootns)", &child, /* flags= */ 0);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to wait for child: %m");
 

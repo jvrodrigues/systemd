@@ -55,10 +55,67 @@ if (SYSTEMD_LOG_TARGET=console varlinkctl call \
         /run/systemd/userdb/io.systemd.NamespaceResource \
         io.systemd.NamespaceResource.AllocateUserRange \
         '{"name":"test-supported","size":65536,"userNamespaceFileDescriptor":0}' 2>&1 || true) |
-            grep -q "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported"; then
+            grep "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported" >/dev/null; then
     echo "User namespace interface not supported, skipping mountfsd/nsresourced tests"
     exit 0
 fi
+
+# Test delegated UID ranges
+# Verify that delegated ranges show up in uid_map (6 lines: 1 primary + 2 container ranges + 3 dynamic users)
+test "$(run0 -u testuser --pipe unshare --user varlinkctl --exec call \
+        --push-fd=/proc/self/ns/user \
+        /run/systemd/userdb/io.systemd.NamespaceResource \
+        io.systemd.NamespaceResource.AllocateUserRange \
+        '{"name":"test-delegate","size":65536,"userNamespaceFileDescriptor":0,"delegateContainerRanges":2}' \
+        -- cat /proc/self/uid_map | wc -l)" -eq 3
+
+# Test that delegateContainerRanges > 16 fails with TooManyDelegations error
+(! run0 -u testuser --pipe unshare --user varlinkctl call \
+        --push-fd=/proc/self/ns/user \
+        /run/systemd/userdb/io.systemd.NamespaceResource \
+        io.systemd.NamespaceResource.AllocateUserRange \
+        '{"name":"test-fail","size":65536,"userNamespaceFileDescriptor":0,"delegateContainerRanges":17}') |&
+            grep "io.systemd.NamespaceResource.TooManyDelegations" >/dev/null
+
+# Test self mapping
+# Verify that self mapping maps the peer UID to root (uid_map should show "0 <peer_uid> 1")
+test "$(run0 -u testuser --pipe unshare --user varlinkctl --exec call \
+        --push-fd=/proc/self/ns/user \
+        /run/systemd/userdb/io.systemd.NamespaceResource \
+        io.systemd.NamespaceResource.AllocateUserRange \
+        '{"name":"test-id","target":0,"size":1,"userNamespaceFileDescriptor":0,"type":"self"}' \
+        -- cat /proc/self/uid_map | awk '{print $1, $3}')" = "0 1"
+
+# Test nested delegation with self mapping
+test "$(run0 -u testuser --pipe unshare --user varlinkctl --exec call \
+        --push-fd=/proc/self/ns/user \
+        /run/systemd/userdb/io.systemd.NamespaceResource \
+        io.systemd.NamespaceResource.AllocateUserRange \
+        '{"name":"test-delegate2","type":"self","size":1,"userNamespaceFileDescriptor":0,"delegateContainerRanges":3}' \
+        -- unshare --user varlinkctl --exec call \
+            --push-fd=/proc/self/ns/user \
+            /run/systemd/userdb/io.systemd.NamespaceResource \
+            io.systemd.NamespaceResource.AllocateUserRange \
+            '{"name":"test-delegate3","size":65536,"userNamespaceFileDescriptor":0,"delegateContainerRanges":2}' \
+            -- cat /proc/self/uid_map | wc -l)" -eq 3
+
+# Test mapForeign parameter
+# Verify that the foreign UID range is mapped into the user namespace
+# When mapForeign is true, uid_map should have 2 lines: primary range + foreign range
+test "$(run0 -u testuser --pipe unshare --user varlinkctl --exec call \
+        --push-fd=/proc/self/ns/user \
+        /run/systemd/userdb/io.systemd.NamespaceResource \
+        io.systemd.NamespaceResource.AllocateUserRange \
+        '{"name":"test-foreign","size":65536,"userNamespaceFileDescriptor":0,"mapForeign":true}' \
+        -- cat /proc/self/uid_map | wc -l)" -eq 2
+
+# Verify the foreign range is mapped 1:1.
+test "$(run0 -u testuser --pipe unshare --user varlinkctl --exec call \
+        --push-fd=/proc/self/ns/user \
+        /run/systemd/userdb/io.systemd.NamespaceResource \
+        io.systemd.NamespaceResource.AllocateUserRange \
+        '{"name":"test-foreign2","size":65536,"userNamespaceFileDescriptor":0,"mapForeign":true}' \
+        -- cat /proc/self/uid_map | grep -c 2147352576)" -eq 1
 
 # This should work without the key
 systemd-dissect --image-policy='root=verity:=absent+unused' --mtree /var/tmp/unpriv.raw >/dev/null
@@ -76,7 +133,7 @@ if [ "$VERITY_SIG_SUPPORTED" -eq 1 ]; then
     systemd-run -M testuser@ --user --pipe --wait \
         --property RootImage="$MINIMAL_IMAGE.raw" \
         --property ExtensionImages=/tmp/app0.raw \
-        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\""
+        bash -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\""
 
     # Without a signature this should not work, as mountfsd should reject it, even if we explicitly ask to
     # trust it
@@ -84,13 +141,50 @@ if [ "$VERITY_SIG_SUPPORTED" -eq 1 ]; then
     (! systemd-run -M testuser@ --user --pipe --wait \
         --property RootImage="$MINIMAL_IMAGE.raw" \
         --property ExtensionImages=/tmp/app0.raw \
-        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\"")
+        bash -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\"")
     (! systemd-run -M testuser@ --user --pipe --wait \
         --property RootImage="$MINIMAL_IMAGE.raw" \
         --property ExtensionImages=/tmp/app0.raw \
         --property ExtensionImagePolicy=root=verity+signed+absent:usr=verity+signed+absent \
-        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\"")
+        bash -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\"")
     mv /tmp/app0.roothash.p7s.bak /tmp/app0.roothash.p7s
+
+    # Mount options should not be allowed without elevated privileges
+    (! systemd-run -M testuser@ --user --pipe --wait \
+        --property RootImage="$MINIMAL_IMAGE.gpt" \
+        --property RootImageOptions="root:ro,noatime,nosuid home:ro,dev nosuid,dev" \
+        --property RootImageOptions="home:ro,dev nosuid,dev,%%foo" \
+        true)
+    (! systemd-run -M testuser@ --user --pipe --wait \
+        --property RootImage="$MINIMAL_IMAGE.raw" \
+        --property ExtensionImages=/tmp/app0.raw \
+        --property MountImages=/tmp/app0.raw:/var/tmp:noatime,nosuid \
+        true)
+
+    mkdir -p /etc/polkit-1/rules.d
+    cat >/etc/polkit-1/rules.d/mountoptions.rules <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id == "io.systemd.mount-file-system.mount-untrusted-image-privately" &&
+            action.lookup("mount_options") == "root:nosuid") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+    systemctl try-reload-or-restart polkit.service
+
+    systemd-run -M testuser@ --user --pipe --wait \
+        --property RootImage="$MINIMAL_IMAGE.gpt" \
+        --property RootImageOptions="root:nosuid" \
+        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && mount | grep -F squashfs | grep -F nosuid >/dev/null"
+
+    systemd-run -M testuser@ --user --pipe --wait \
+        --property RootImage="$MINIMAL_IMAGE.raw" \
+        --property ExtensionImages=/tmp/app0.raw \
+        --property MountImages=/tmp/app0.raw:/var/tmp:nosuid \
+        sh -c "test -e \"/dev/mapper/${MINIMAL_IMAGE_ROOTHASH}-verity\" && test -e \"/dev/mapper/$(</tmp/app0.roothash)-verity\" && mount | grep -F /var/tmp | grep -F nosuid >/dev/null"
+
+    rm -f /etc/polkit-1/rules.d/mountoptions.rules
+    systemctl try-reload-or-restart polkit.service
 fi
 
 # Bare squashfs without any verity or signature also should be rejected, even if we ask to trust it

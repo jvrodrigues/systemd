@@ -35,7 +35,7 @@
 #include "logind-utmp.h"
 #include "logind-varlink.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "service-util.h"
@@ -236,7 +236,7 @@ static int manager_enumerate_buttons(Manager *m) {
         FOREACH_DEVICE(e, d) {
                 if (device_is_processed(d) <= 0)
                         continue;
-                RET_GATHER(r, manager_process_button_device(m, d));
+                RET_GATHER(r, manager_process_button_device(m, d, /* ret_button= */ NULL));
         }
 
         return r;
@@ -580,7 +580,7 @@ static int manager_enumerate_fds(Manager *m, int *ret_varlink_fd) {
         assert(m);
         assert(ret_varlink_fd);
 
-        n = sd_listen_fds_with_names(/* unset_environment = */ true, &fdnames);
+        n = sd_listen_fds_with_names(/* unset_environment= */ true, &fdnames);
         if (n < 0)
                 return log_error_errno(n, "Failed to acquire passed fd list: %m");
 
@@ -739,10 +739,13 @@ static int manager_dispatch_vcsa_udev(sd_device_monitor *monitor, sd_device *dev
 
 static int manager_dispatch_button_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
+        Button *b;
 
         assert(device);
 
-        manager_process_button_device(m, device);
+        if (manager_process_button_device(m, device, &b) > 0)
+                (void) button_check_switches(b);
+
         return 0;
 }
 
@@ -877,7 +880,7 @@ static int manager_vt_switch(sd_event_source *src, const struct signalfd_siginfo
                         return 0;
                 }
 
-                r = vt_release(fd, /* restore = */ true);
+                r = vt_release(fd, /* restore= */ true);
                 if (r < 0)
                         log_warning_errno(r, "Failed to release current VT, ignoring: %m");
 
@@ -979,7 +982,7 @@ static int manager_connect_udev(Manager *m) {
                 return r;
 
         FOREACH_STRING(s, "input", "graphics", "drm") {
-                r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, s, /* devtype = */ NULL);
+                r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, s, /* devtype= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1073,7 +1076,7 @@ static void manager_gc(Manager *m, bool drop_not_started) {
                 seat->in_gc_queue = false;
 
                 if (seat_may_gc(seat, drop_not_started)) {
-                        seat_stop(seat, /* force = */ false);
+                        seat_stop(seat, /* force= */ false);
                         seat_free(seat);
                 }
         }
@@ -1084,7 +1087,7 @@ static void manager_gc(Manager *m, bool drop_not_started) {
                 /* First, if we are not closing yet, initiate stopping. */
                 if (session_may_gc(session, drop_not_started) &&
                     session_get_state(session) != SESSION_CLOSING)
-                        (void) session_stop(session, /* force = */ false);
+                        (void) session_stop(session, /* force= */ false);
 
                 /* Normally, this should make the session referenced again, if it doesn't then let's get rid
                  * of it immediately. */
@@ -1113,6 +1116,7 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
         Manager *m = ASSERT_PTR(userdata);
         struct dual_timestamp since;
         usec_t n, elapse;
+        bool idle;
         int r;
 
         if (m->idle_action == HANDLE_IGNORE ||
@@ -1121,8 +1125,8 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
 
         n = now(CLOCK_MONOTONIC);
 
-        r = manager_get_idle_hint(m, &since);
-        if (r <= 0) {
+        idle = manager_get_idle_hint(m, &since);
+        if (!idle) {
                 /* Not idle. Let's check if after a timeout it might be idle then. */
                 elapse = n + m->idle_action_usec;
                 m->was_idle = false;
@@ -1368,8 +1372,6 @@ static int run(int argc, char *argv[]) {
         (void) mkdir_label("/run/systemd/seats", 0755);
         (void) mkdir_label("/run/systemd/users", 0755);
         (void) mkdir_label("/run/systemd/sessions", 0755);
-
-        assert_se(sigprocmask_many(SIG_BLOCK, /* ret_old_mask= */ NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)

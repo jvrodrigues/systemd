@@ -2,7 +2,8 @@
 #pragma once
 
 #include "basic-forward.h"
-#include "strv-fundamental.h"   /* IWYU pragma: export */
+
+#include "../fundamental/strv.h"   /* IWYU pragma: export */
 
 char* strv_find(char * const *l, const char *name) _pure_;
 char* strv_find_case(char * const *l, const char *name) _pure_;
@@ -102,10 +103,6 @@ char** strv_new_ap(const char *x, va_list ap);
 
 static inline const char* STRV_IFNOTNULL(const char *x) {
         return x ?: STRV_IGNORE;
-}
-
-static inline bool strv_isempty(char * const *l) {
-        return !l || !*l;
 }
 
 int strv_split_full(char ***t, const char *s, const char *separators, ExtractFlags flags);
@@ -221,3 +218,9 @@ int string_strv_ordered_hashmap_put(OrderedHashmap **h, const char *key, const c
 int strv_rebreak_lines(char **l, size_t width, char ***ret);
 
 char** strv_filter_prefix(char * const *l, const char *prefix);
+
+/* whenever we need to initialize something with a constant non-NULL, but empty strv, we can use this shared
+ * one */
+extern const char* const strv_empty[1];
+
+#define STRV_EMPTY ((char**) strv_empty)

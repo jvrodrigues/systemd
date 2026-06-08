@@ -14,6 +14,7 @@
 #include "memstream-util.h"
 #include "namespace-util.h"
 #include "parse-util.h"
+#include "pidfd-util.h"
 #include "process-util.h"
 #include "signal-util.h"
 #include "special.h"
@@ -32,10 +33,13 @@ static const char * const metadata_field_table[_META_MAX] = {
         [META_ARGV_HOSTNAME]  = "COREDUMP_HOSTNAME=",
         [META_ARGV_DUMPABLE]  = "COREDUMP_DUMPABLE=",
         [META_ARGV_PIDFD]     = "COREDUMP_BY_PIDFD=",
+        [META_ARGV_TID]       = "COREDUMP_TID=",
         [META_COMM]           = "COREDUMP_COMM=",
         [META_EXE]            = "COREDUMP_EXE=",
         [META_UNIT]           = "COREDUMP_UNIT=",
         [META_PROC_AUXV]      = "COREDUMP_PROC_AUXV=",
+        [META_THREAD_NAME]    = "COREDUMP_THREAD_NAME=",
+        [META_CODE]           = "COREDUMP_CODE=",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(metadata_field, MetadataField);
@@ -49,6 +53,7 @@ void coredump_context_done(CoredumpContext *context) {
         free(context->exe);
         free(context->unit);
         free(context->auxv);
+        free(context->thread_name);
         safe_close(context->mount_tree_fd);
         iovw_done_free(&context->iovw);
         safe_close(context->input_fd);
@@ -150,6 +155,7 @@ static int get_process_container_parent_cmdline(PidRef *pid, char** ret_cmdline)
 
         assert(pidref_is_set(pid));
         assert(!pidref_is_remote(pid));
+        assert(ret_cmdline);
 
         r = pidref_from_same_root_fs(pid, &PIDREF_MAKE_FROM_PID(1));
         if (r < 0)
@@ -170,6 +176,34 @@ static int get_process_container_parent_cmdline(PidRef *pid, char** ret_cmdline)
                 return r;
 
         return 1;
+}
+
+/* The kernel passes si_signo through core_pattern (%s). Starting with v7.1,
+ * si_code is reported as well via pidfd. */
+static int coredump_context_read_pidfd_info(CoredumpContext *context) {
+        struct pidfd_info info = {
+                .mask = PIDFD_INFO_COREDUMP,
+        };
+        int r;
+
+        assert(context);
+        assert(pidref_is_set(&context->pidref));
+
+        if (!context->got_pidfd || context->pidref.fd < 0)
+                return 0;
+
+        r = pidfd_get_info(context->pidref.fd, &info);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return log_debug_errno(r, "PIDFD_INFO_COREDUMP not supported, ignoring: %m");
+        if (r < 0)
+                return log_debug_errno(r, "Failed to get pidfd coredump info, ignoring: %m");
+
+        if (FLAGS_SET(info.mask, PIDFD_INFO_COREDUMP_CODE)) {
+                context->code = (int) info.coredump_code;
+                context->got_code = true;
+        }
+
+        return 0;
 }
 
 int coredump_context_build_iovw(CoredumpContext *context) {
@@ -209,6 +243,10 @@ int coredump_context_build_iovw(CoredumpContext *context) {
                         return log_error_errno(r, "Failed to add COREDUMP_SIGNAL= field: %m");
 
                 (void) iovw_put_string_field(&context->iovw, "COREDUMP_SIGNAL_NAME=SIG", signal_to_string(context->signo));
+
+                /* Emit si_code if we learned it from pidfd_info */
+                if (context->got_code)
+                        (void) iovw_put_string_fieldf(&context->iovw, "COREDUMP_CODE=", "%i", context->code);
         }
 
         r = iovw_put_string_fieldf(&context->iovw, "COREDUMP_TIMESTAMP=", USEC_FMT, context->timestamp);
@@ -227,6 +265,12 @@ int coredump_context_build_iovw(CoredumpContext *context) {
         r = iovw_put_string_field(&context->iovw, "COREDUMP_COMM=", context->comm);
         if (r < 0)
                 return log_error_errno(r, "Failed to add COREDUMP_COMM= field: %m");
+
+        if (context->tid > 0)
+                (void) iovw_put_string_fieldf(&context->iovw, "COREDUMP_TID=", PID_FMT, context->tid);
+
+        if (context->thread_name)
+                (void) iovw_put_string_field(&context->iovw, "COREDUMP_THREAD_NAME=", context->thread_name);
 
         if (context->exe)
                 (void) iovw_put_string_field(&context->iovw, "COREDUMP_EXE=", context->exe);
@@ -320,7 +364,7 @@ static void coredump_context_check_pidns(CoredumpContext *context) {
         assert(context);
         assert(pidref_is_set(&context->pidref));
 
-        r = pidref_in_same_namespace(/* pid1 = */ NULL, &context->pidref, NAMESPACE_PID);
+        r = pidref_in_same_namespace(/* pid1= */ NULL, &context->pidref, NAMESPACE_PID);
         if (r < 0)
                 log_debug_errno(r, "Failed to check pidns of crashing process, ignoring: %m");
 
@@ -339,6 +383,12 @@ static int coredump_context_parse_from_procfs(CoredumpContext *context) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get COMM: %m");
 
+        if (context->tid > 0) {
+                r = pid_get_comm(context->tid, &context->thread_name);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to get comm for thread "PID_FMT", ignoring: %m", context->tid);
+        }
+
         r = get_process_exe(pid, &context->exe);
         if (r < 0)
                 log_warning_errno(r, "Failed to get EXE, ignoring: %m");
@@ -350,6 +400,8 @@ static int coredump_context_parse_from_procfs(CoredumpContext *context) {
         r = read_full_file(procfs_file_alloca(pid, "auxv"), &context->auxv, &context->auxv_size);
         if (r < 0)
                 log_warning_errno(r, "Failed to get auxv, ignoring: %m");
+
+        (void) coredump_context_read_pidfd_info(context);
 
         r = pidref_verify(&context->pidref);
         if (r < 0)
@@ -465,6 +517,12 @@ static int context_parse_one(CoredumpContext *context, MetadataField meta, bool 
                 context->got_pidfd = 1;
                 return 0;
         }
+        case META_ARGV_TID:
+                r = parse_pid(s, &context->tid);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse TID \"%s\", ignoring: %m", s);
+                return 0;
+
         case META_COMM:
                 return free_and_strdup_warn(&context->comm, s);
 
@@ -473,6 +531,20 @@ static int context_parse_one(CoredumpContext *context, MetadataField meta, bool 
 
         case META_UNIT:
                 return free_and_strdup_warn(&context->unit, s);
+
+        case META_THREAD_NAME:
+                return free_and_strdup_warn(&context->thread_name, s);
+
+        case META_CODE:
+                /* We must accept both positive and negative values. The former
+                 * are reserved for kernel-generated signals, the latter for signals requested
+                 * from userspace. See /usr/include/bits/siginfo-consts.h. */
+                r = safe_atoi(s, &context->code);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse code \"%s\", ignoring: %m", s);
+                else
+                        context->got_code = true;
+                return 0;
 
         case META_PROC_AUXV: {
                 char *t = memdup_suffix0(s, size);

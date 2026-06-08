@@ -6,9 +6,7 @@
 #include "sd-id128.h"
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "bus-common-errors.h"
-#include "bus-get-properties.h"
 #include "bus-locator.h"
 #include "bus-message-util.h"
 #include "bus-object.h"
@@ -27,8 +25,8 @@
 #include "io-util.h"
 #include "machine.h"
 #include "machine-dbus.h"
-#include "machine-pool.h"
 #include "machined.h"
+#include "machined-dbus.h"
 #include "namespace-util.h"
 #include "operation.h"
 #include "os-util.h"
@@ -39,7 +37,25 @@
 #include "unit-def.h"
 #include "user-util.h"
 
-static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_pool_path, "s", "/var/lib/machines");
+static int property_get_pool_path(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _cleanup_free_ char *poolpath = NULL;
+        Manager *m = ASSERT_PTR(userdata);
+
+        assert(bus);
+        assert(reply);
+
+        (void) image_get_pool_path(m->runtime_scope, IMAGE_MACHINE, &poolpath);
+
+        return sd_bus_message_append(reply, "s", strempty(poolpath));
+}
 
 static int property_get_pool_usage(
                 sd_bus *bus,
@@ -50,19 +66,13 @@ static int property_get_pool_usage(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_ int fd = -EBADF;
+        Manager *m = ASSERT_PTR(userdata);
         uint64_t usage = UINT64_MAX;
 
         assert(bus);
         assert(reply);
 
-        fd = open("/var/lib/machines", O_RDONLY|O_CLOEXEC|O_DIRECTORY);
-        if (fd >= 0) {
-                BtrfsQuotaInfo q;
-
-                if (btrfs_subvol_get_subtree_quota_fd(fd, 0, &q) >= 0)
-                        usage = q.referenced;
-        }
+        (void) image_get_pool_usage(m->runtime_scope, IMAGE_MACHINE, &usage);
 
         return sd_bus_message_append(reply, "t", usage);
 }
@@ -76,19 +86,13 @@ static int property_get_pool_limit(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_ int fd = -EBADF;
+        Manager *m = ASSERT_PTR(userdata);
         uint64_t size = UINT64_MAX;
 
         assert(bus);
         assert(reply);
 
-        fd = open("/var/lib/machines", O_RDONLY|O_CLOEXEC|O_DIRECTORY);
-        if (fd >= 0) {
-                BtrfsQuotaInfo q;
-
-                if (btrfs_subvol_get_subtree_quota_fd(fd, 0, &q) >= 0)
-                        size = q.referenced_max;
-        }
+        (void) image_get_pool_limit(m->runtime_scope, IMAGE_MACHINE, &size);
 
         return sd_bus_message_append(reply, "t", size);
 }
@@ -252,6 +256,9 @@ static int machine_add_from_params(
         assert(manager);
         assert(message);
         assert(name);
+        assert(c == _MACHINE_CLASS_INVALID || MACHINE_CLASS_CAN_REGISTER(c));
+        assert(leader_pidref);
+        assert(supervisor_pidref);
         assert(ret);
 
         if (leader_pidref->pid == 1)
@@ -270,12 +277,33 @@ static int machine_add_from_params(
                 return r;
 
         /* Ensure an unprivileged user cannot claim any process they don't control as their own machine */
-        if (uid != 0) {
+        switch (manager->runtime_scope) {
+
+        case RUNTIME_SCOPE_SYSTEM:
+                /* In system mode root may register anything */
+                if (uid == 0)
+                        break;
+
+                /* And non-root may only register things if they own the userns */
                 r = process_is_owned_by_uid(leader_pidref, uid);
                 if (r < 0)
                         return r;
-                if (r == 0)
-                        return sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED, "Only root may register machines for other users");
+                if (r > 0)
+                        break;
+
+                /* Nothing else may */
+                return sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED, "Only root may register machines for other users");
+
+        case RUNTIME_SCOPE_USER:
+                /* In user mode the user owning our instance may register anything. */
+                if (uid == getuid())
+                        break;
+
+                /* Nothing else may */
+                return sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED, "Other users may not register machines with us, sorry.");
+
+        default:
+                assert_not_reached();
         }
 
         if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
@@ -291,10 +319,8 @@ static int machine_add_from_params(
                                 details,
                                 &manager->polkit_registry,
                                 error);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        return 0; /* Will call us back */
+                if (r <= 0)
+                        return r; /* 0 means Polkit will call us back, see method_create_machine() */
         }
 
         r = manager_add_machine(manager, name, &m);
@@ -410,7 +436,7 @@ static int method_create_or_register_machine(
                 c = _MACHINE_CLASS_INVALID;
         else {
                 c = machine_class_from_string(class);
-                if (c < 0)
+                if (c < 0 || !MACHINE_CLASS_CAN_REGISTER(c))
                         return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid machine class parameter");
         }
 
@@ -440,7 +466,7 @@ static int method_create_or_register_machine(
                         supervisor_pidref = TAKE_PIDREF(client_pidref);
         }
 
-        if (hashmap_get(manager->machines, name))
+        if (hashmap_contains(manager->machines, name))
                 return sd_bus_error_setf(error, BUS_ERROR_MACHINE_EXISTS, "Machine '%s' already exists", name);
 
         return machine_add_from_params(
@@ -456,7 +482,7 @@ static int method_create_or_register_machine(
                         root_directory,
                         netif,
                         n_netif,
-                        /* cid= */ 0,
+                        /* cid= */ VMADDR_CID_ANY,
                         /* ssh_address= */ NULL,
                         /* ssh_private_key_path= */ NULL,
                         ret,
@@ -585,14 +611,14 @@ static int method_create_or_register_machine_ex(
                 c = _MACHINE_CLASS_INVALID;
         else {
                 c = machine_class_from_string(class);
-                if (c < 0)
+                if (c < 0 || !MACHINE_CLASS_CAN_REGISTER(c))
                         return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid machine class parameter");
         }
 
         if (!isempty(root_directory) && (!path_is_absolute(root_directory) || !path_is_valid(root_directory)))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Root directory must be empty or an absolute path");
 
-        if (hashmap_get(manager->machines, name))
+        if (hashmap_contains(manager->machines, name))
                 return sd_bus_error_setf(error, BUS_ERROR_MACHINE_EXISTS, "Machine '%s' already exists", name);
 
         /* If a PID is specified that's the leader, but if the client process is different from it, than that's the supervisor */
@@ -1056,9 +1082,13 @@ static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus
         }
 
         /* Set up the machine directory if necessary */
-        r = setup_machine_directory(error, /* use_btrfs_subvol= */ true, /* use_btrfs_quota= */ true);
+        r = image_setup_pool(
+                        m->runtime_scope,
+                        IMAGE_MACHINE,
+                        /* use_btrfs_subvol= */ true,
+                        /* use_btrfs_quota= */ true);
         if (r < 0)
-                return r;
+                return sd_bus_error_set_errnof(error, r, "Failed to set up machine pool: %m");
 
         r = image_set_pool_limit(m->runtime_scope, IMAGE_MACHINE, limit);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
@@ -1191,7 +1221,7 @@ static int method_map_to_machine_group(sd_bus_message *message, void *userdata, 
         return sd_bus_reply_method_return(message, "sou", machine->name, o, (uint32_t) converted);
 }
 
-const sd_bus_vtable manager_vtable[] = {
+static const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
         SD_BUS_PROPERTY("PoolPath", "s", property_get_pool_path, 0, 0),
@@ -1423,8 +1453,8 @@ const BusObjectImplementation manager_object = {
         "/org/freedesktop/machine1",
         "org.freedesktop.machine1.Manager",
         .vtables = BUS_VTABLES(manager_vtable),
-        .children = BUS_IMPLEMENTATIONS( &machine_object,
-                                         &image_object ),
+        .children = BUS_IMPLEMENTATIONS(&machine_object,
+                                        &image_object),
 };
 
 int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1614,6 +1644,12 @@ int manager_unit_is_active(Manager *manager, const char *unit, sd_bus_error *ret
         assert(manager);
         assert(unit);
 
+        r = sd_bus_is_ready(manager->api_bus);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -ENOTCONN;
+
         path = unit_dbus_path_from_name(unit);
         if (!path)
                 return -ENOMEM;
@@ -1653,6 +1689,12 @@ int manager_job_is_active(Manager *manager, const char *path, sd_bus_error *rete
 
         assert(manager);
         assert(path);
+
+        r = sd_bus_is_ready(manager->api_bus);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -ENOTCONN;
 
         r = sd_bus_get_property(
                         manager->api_bus,

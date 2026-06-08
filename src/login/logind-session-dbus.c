@@ -117,7 +117,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", session_get_idle_hint(s, NULL) > 0);
+        return sd_bus_message_append(reply, "b", session_get_idle_hint(s, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_can_idle(
@@ -164,16 +164,13 @@ static int property_get_idle_since_hint(
                 sd_bus_error *error) {
 
         Session *s = ASSERT_PTR(userdata);
-        dual_timestamp t = DUAL_TIMESTAMP_NULL;
+        dual_timestamp t;
         uint64_t u;
-        int r;
 
         assert(bus);
         assert(reply);
 
-        r = session_get_idle_hint(s, &t);
-        if (r < 0)
-                return r;
+        session_get_idle_hint(s, &t);
 
         u = streq(property, "IdleSinceHint") ? t.realtime : t.monotonic;
 
@@ -216,7 +213,7 @@ int bus_session_method_terminate(sd_bus_message *message, void *userdata, sd_bus
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = session_stop(s, /* force = */ true);
+        r = session_stop(s, /* force= */ true);
         if (r < 0)
                 return r;
 
@@ -985,6 +982,7 @@ static const sd_bus_vtable session_vtable[] = {
         SD_BUS_PROPERTY("Remote", "b", bus_property_get_bool, offsetof(Session, remote), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemoteHost", "s", NULL, offsetof(Session, remote_host), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemoteUser", "s", NULL, offsetof(Session, remote_user), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("ExtraDeviceAccess", "as", NULL, offsetof(Session, extra_device_access), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Session, service), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Desktop", "s", NULL, offsetof(Session, desktop), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Session, scope), SD_BUS_VTABLE_PROPERTY_CONST),

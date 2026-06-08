@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
 #include "shared-forward.h"
 
 typedef enum PromptFlags {
@@ -16,6 +14,7 @@ typedef enum PromptFlags {
 
 int prompt_loop(const char *text,
                 Glyph emoji,
+                const char *prefill,
                 char **menu,
                 char **accepted,
                 unsigned ellipsize_percentage,

@@ -231,7 +231,7 @@ static int gather_stdout_three(int fd, void *arg) {
         return 0;
 }
 
-const gather_stdout_callback_t gather_stdouts[] = {
+static const gather_stdout_callback_t gather_stdouts[] = {
         gather_stdout_one,
         gather_stdout_two,
         gather_stdout_three,
@@ -409,8 +409,8 @@ TEST(error_catching) {
 
         r = execute_directories(__func__,
                                 dirs, DEFAULT_TIMEOUT_USEC,
-                                /* callbacks = */ NULL, /* callback_args = */ NULL,
-                                /* argv = */ NULL, /* envp = */ NULL, /* flags = */ 0);
+                                /* callbacks= */ NULL, /* callback_args= */ NULL,
+                                /* argv= */ NULL, /* envp= */ NULL, /* flags= */ 0);
 
         /* we should exit with the error code of the first script that failed */
         assert_se(r == 42);

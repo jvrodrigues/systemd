@@ -19,6 +19,7 @@
 #include "networkd-address.h"
 #include "networkd-address-pool.h"
 #include "networkd-dhcp-prefix-delegation.h"
+#include "networkd-dhcp-relay.h"
 #include "networkd-dhcp-server.h"
 #include "networkd-ipv4acd.h"
 #include "networkd-link.h"
@@ -162,7 +163,7 @@ DEFINE_HASH_OPS(
         address_hash_func,
         address_compare_func);
 
-DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
         address_section_hash_ops,
         ConfigSection,
         config_section_hash_func,
@@ -172,6 +173,8 @@ DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 
 int address_new(Address **ret) {
         _cleanup_(address_unrefp) Address *address = NULL;
+
+        assert(ret);
 
         address = new(Address, 1);
         if (!address)
@@ -242,6 +245,9 @@ static Address* address_detach_impl(Address *address) {
 
                 if (address->network->dhcp_server_address == address)
                         address->network->dhcp_server_address = NULL;
+
+                if (address->network->dhcp_relay_agent_address == address)
+                        address->network->dhcp_relay_agent_address = NULL;
 
                 address->network = NULL;
                 return address;
@@ -812,13 +818,13 @@ static int address_update(Address *address) {
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
                 return 0;
 
-        r = address_set_masquerade(address, /* add = */ true);
+        r = address_set_masquerade(address, /* add= */ true);
         if (r < 0)
                 return log_link_warning_errno(link, r, "Could not enable IP masquerading: %m");
 
         address_add_netlabel(address);
 
-        address_modify_nft_set(address, /* add = */ true);
+        address_modify_nft_set(address, /* add= */ true);
 
         if (address_is_ready(address) && address->callback) {
                 r = address->callback(address);
@@ -826,7 +832,7 @@ static int address_update(Address *address) {
                         return r;
         }
 
-        link_update_operstate(link, /* also_update_master = */ true);
+        link_update_operstate(link, /* also_update_master= */ true);
         link_check_ready(link);
         return 0;
 }
@@ -876,20 +882,54 @@ static int address_drop(Address *in, bool removed_by_us) {
         Link *link = ASSERT_PTR(address->link);
         int r;
 
-        r = address_set_masquerade(address, /* add = */ false);
+        r = address_set_masquerade(address, /* add= */ false);
         if (r < 0)
                 log_link_warning_errno(link, r, "Failed to disable IP masquerading, ignoring: %m");
 
-        address_modify_nft_set(address, /* add = */ false);
+        address_modify_nft_set(address, /* add= */ false);
 
         address_del_netlabel(address);
 
-        /* FIXME: if the IPv6LL address is dropped, stop DHCPv6, NDISC, RADV. */
         if (address->family == AF_INET6 &&
-            in6_addr_equal(&address->in_addr.in6, &link->ipv6ll_address))
+            in6_addr_equal(&address->in_addr.in6, &link->ipv6ll_address)) {
                 link->ipv6ll_address = (const struct in6_addr) {};
 
+                Address *a;
+                bool has_replacement;
+
+                /* If another ready IPv6LL address exists on this link, use it instead. */
+                SET_FOREACH(a, link->addresses) {
+                        if (a == address)
+                                continue;
+                        if (a->family != AF_INET6)
+                                continue;
+                        if (!in6_addr_is_link_local(&a->in_addr.in6))
+                                continue;
+                        if (!address_is_ready(a))
+                                continue;
+                        link->ipv6ll_address = a->in_addr.in6;
+                        break;
+                }
+
+                has_replacement = in6_addr_is_set(&link->ipv6ll_address);
+
+                /* Stop engines bound to the dropped IPv6LL source address. Do not return early on error.
+                 * address_detach() and link_update_operstate() must run to keep link state consistent. */
+                r = link_ipv6ll_lost(link, &address->in_addr.in6, has_replacement);
+                if (r < 0)
+                        log_link_warning_errno(link, r, "Failed to stop IPv6 services after IPv6LL loss, ignoring: %m");
+
+                /* If another IPv6LL address is available, restart engines with it. */
+                if (has_replacement) {
+                        r = link_ipv6ll_gained(link);
+                        if (r < 0)
+                                log_link_warning_errno(link, r, "Failed to restart IPv6 services with alternate IPv6LL address, ignoring: %m");
+                }
+        }
+
         ipv4acd_detach(link, address);
+
+        (void) link_dhcp_relay_address_dropped(link, address);
 
         address_detach(address);
 
@@ -901,7 +941,7 @@ static int address_drop(Address *in, bool removed_by_us) {
                 }
         }
 
-        link_update_operstate(link, /* also_update_master = */ true);
+        link_update_operstate(link, /* also_update_master= */ true);
         link_check_ready(link);
         return 0;
 }
@@ -1226,7 +1266,7 @@ static int address_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, Remov
                                             r, "Could not drop address");
 
                 /* If the address cannot be removed, then assume the address is already removed. */
-                address_forget(link, address, /* removed_by_us = */ true, "Forgetting");
+                address_forget(link, address, /* removed_by_us= */ true, "Forgetting");
         }
 
         return 1;
@@ -1933,7 +1973,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
         if (type == RTM_DELADDR) {
                 if (address)
                         address_forget(link, address,
-                                       /* removed_by_us = */ FLAGS_SET(address->state, NETWORK_CONFIG_STATE_REMOVING),
+                                       /* removed_by_us= */ FLAGS_SET(address->state, NETWORK_CONFIG_STATE_REMOVING),
                                        "Forgetting removed");
                 else
                         log_address_debug(tmp, "Kernel removed unknown", link);
@@ -2074,8 +2114,8 @@ static int config_parse_broadcast(
 
         r = config_parse_in_addr_non_null(
                         unit, filename, line, section, section_line,
-                        lvalue, /* ltype = */ AF_INET, rvalue,
-                        &address->broadcast, /* userdata = */ NULL);
+                        lvalue, /* ltype= */ AF_INET, rvalue,
+                        &address->broadcast, /* userdata= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -2111,7 +2151,7 @@ static int config_parse_address(
                 return 1;
         }
 
-        r = config_parse_in_addr_prefix(unit, filename, line, section, section_line, lvalue, /* ltype = */ true, rvalue, &prefix, /* userdata = */ NULL);
+        r = config_parse_in_addr_prefix(unit, filename, line, section, section_line, lvalue, /* ltype= */ true, rvalue, &prefix, /* userdata= */ NULL);
         if (r <= 0)
                 return r;
 
@@ -2476,9 +2516,13 @@ int network_drop_invalid_addresses(Network *network) {
                 assert(r > 0);
         }
 
+        /* Detach duplicated entries now. */
+        duplicated_addresses = set_free(duplicated_addresses);
+
         r = network_adjust_dhcp_server(network, &addresses);
         if (r < 0)
                 return r;
 
+        network_adjust_dhcp_relay(network);
         return 0;
 }

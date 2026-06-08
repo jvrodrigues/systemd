@@ -12,6 +12,7 @@
 #include "glyph-util.h"
 #include "in-addr-util.h"
 #include "json-util.h"
+#include "netlink-util.h"
 #include "nss-util.h"
 #include "resolved-def.h"
 #include "signal-util.h"
@@ -48,6 +49,8 @@ static bool error_shall_try_again(const char *error_id) {
 static int connect_to_resolved(sd_varlink **ret) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
         int r;
+
+        assert(ret);
 
         r = sd_varlink_connect_address(&link, "/run/systemd/resolve/io.systemd.Resolve");
         if (r < 0)
@@ -188,6 +191,23 @@ static uint64_t query_flags(void) {
                 query_flag("SYSTEMD_NSS_RESOLVE_NETWORK", 0, SD_RESOLVED_NO_NETWORK);
 }
 
+static int query_ifindex(void) {
+        int ifindex;
+        const char *e;
+
+        e = secure_getenv("SYSTEMD_NSS_RESOLVE_INTERFACE");
+        if (!e)
+                return 0;
+
+        ifindex = rtnl_resolve_interface(/* rtnl= */ NULL, e);
+        if (ifindex < 0) {
+                log_debug_errno(ifindex, "Failed to resolve $SYSTEMD_NSS_RESOLVE_INTERFACE, ignoring: %m");
+                ifindex = 0;
+        }
+
+        return ifindex;
+}
+
 enum nss_status _nss_resolve_gethostbyname4_r(
                 const char *name,
                 struct gaih_addrtuple **pat,
@@ -217,7 +237,8 @@ enum nss_status _nss_resolve_gethostbyname4_r(
         r = sd_json_buildo(
                         &cparams,
                         SD_JSON_BUILD_PAIR_STRING("name", name),
-                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", query_flags()));
+                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", query_flags()),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("ifindex", query_ifindex()));
         if (r < 0)
                 goto fail;
 
@@ -386,7 +407,8 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                         &cparams,
                         SD_JSON_BUILD_PAIR_STRING("name", name),
                         SD_JSON_BUILD_PAIR_INTEGER("family", af),
-                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", query_flags()));
+                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", query_flags()),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("ifindex", query_ifindex()));
         if (r < 0)
                 goto fail;
 
@@ -606,7 +628,8 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
                         &cparams,
                         SD_JSON_BUILD_PAIR_BYTE_ARRAY("address", addr, len),
                         SD_JSON_BUILD_PAIR_INTEGER("family", af),
-                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", query_flags()));
+                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", query_flags()),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("ifindex", query_ifindex()));
         if (r < 0)
                 goto fail;
 

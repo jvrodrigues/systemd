@@ -194,6 +194,7 @@ link	9
 linkat	458
 listen	106
 listmount	568
+listns	580
 listxattr	388
 listxattrat	575
 llistxattr	389
@@ -358,6 +359,7 @@ riscv_flush_icache
 riscv_hwprobe
 rmdir	137
 rseq	527
+rseq_slice_yield	581
 rt_sigaction	352
 rt_sigpending	354
 rt_sigprocmask	353
@@ -513,6 +515,7 @@ uname	339
 unlink	10
 unlinkat	456
 unshare	465
+uprobe
 uretprobe
 userfaultfd	516
 usr26

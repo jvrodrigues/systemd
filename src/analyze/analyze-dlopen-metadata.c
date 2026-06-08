@@ -12,7 +12,7 @@
 #include "json-util.h"
 #include "strv.h"
 
-int verb_dlopen_metadata(int argc, char *argv[], void *userdata) {
+int verb_dlopen_metadata(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         _cleanup_free_ char *abspath = NULL;
@@ -64,7 +64,7 @@ int verb_dlopen_metadata(int argc, char *argv[], void *userdata) {
                         return table_log_add_error(r);
         }
 
-        r = table_print(t, NULL);
+        r = table_print_with_pager(t, SD_JSON_FORMAT_OFF, arg_pager_flags, arg_legend);
         if (r < 0)
                 return table_log_print_error(r);
 

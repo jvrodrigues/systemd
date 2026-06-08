@@ -75,7 +75,7 @@ int main(int argc, char *argv[]) {
         if (!can_memlock())
                 return log_tests_skipped("Can't use mlock()");
 
-        if (!bpf_restrict_fs_supported(/* initialize = */ true))
+        if (!bpf_restrict_fs_supported(/* initialize= */ true))
                 return log_tests_skipped("LSM BPF hooks are not supported");
 
         r = enter_cgroup_subroot(NULL);
@@ -87,7 +87,7 @@ int main(int argc, char *argv[]) {
         ASSERT_NOT_NULL((runtime_dir = setup_fake_runtime_dir()));
 
         ASSERT_OK(manager_new(RUNTIME_SCOPE_SYSTEM, MANAGER_TEST_RUN_BASIC, &m));
-        ASSERT_OK(manager_startup(m, NULL, NULL, NULL));
+        ASSERT_OK(manager_startup(m, NULL, NULL, NULL, NULL));
 
         /* We need to enable access to the filesystem where the binary is so we
          * add @common-block and @application */

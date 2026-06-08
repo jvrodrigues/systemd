@@ -644,7 +644,7 @@ static int bus_method_resolve_address(sd_bus_message *message, void *userdata, s
         if (ifindex < 0)
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid interface index");
 
-        if (validate_and_mangle_query_flags(m, &flags, /* name = */ NULL, /* ok = */ 0) < 0)
+        if (validate_and_mangle_query_flags(m, &flags, /* name= */ NULL, /* ok= */ 0) < 0)
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags parameter");
 
         r = dns_question_new_reverse(&question, family, &a);
@@ -1722,8 +1722,20 @@ static int bus_property_get_resolv_conf_mode(
 
 static int bus_method_reset_statistics(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = ASSERT_PTR(userdata);
+        int r;
 
         assert(message);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.reset-statistics",
+                        /* details= */ NULL,
+                        &m->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Polkit will call us back */
 
         bus_client_log(message, "statistics reset");
 
@@ -1830,8 +1842,20 @@ static int bus_method_get_link(sd_bus_message *message, void *userdata, sd_bus_e
 
 static int bus_method_flush_caches(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = ASSERT_PTR(userdata);
+        int r;
 
         assert(message);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.flush-caches",
+                        /* details= */ NULL,
+                        &m->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Polkit will call us back */
 
         bus_client_log(message, "cache flush");
 
@@ -1842,8 +1866,20 @@ static int bus_method_flush_caches(sd_bus_message *message, void *userdata, sd_b
 
 static int bus_method_reset_server_features(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = ASSERT_PTR(userdata);
+        int r;
 
         assert(message);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.reset-server-features",
+                        /* details= */ NULL,
+                        &m->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Polkit will call us back */
 
         bus_client_log(message, "server feature reset");
 

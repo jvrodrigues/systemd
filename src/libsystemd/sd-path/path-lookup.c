@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "fs-util.h"
 #include "log.h"
+#include "mkdir.h"
 #include "path-lookup.h"
 #include "path-util.h"
 #include "stat-util.h"
@@ -33,9 +34,30 @@ int user_search_dirs(const char *suffix, char ***ret_config_dirs, char ***ret_da
         return 0;
 }
 
-int runtime_directory_generic(RuntimeScope scope, const char *suffix, char **ret) {
-        int r;
+int config_directory_generic(RuntimeScope scope, const char *suffix, char **ret) {
+        assert(ret);
 
+        /* This does not bother with $CONFIGURATION_DIRECTORY, and hence can be applied to get other
+         * service's config dir */
+
+        switch (scope) {
+        case RUNTIME_SCOPE_USER:
+                return xdg_user_config_dir(suffix, ret);
+
+        case RUNTIME_SCOPE_SYSTEM: {
+                char *d = path_join("/etc", suffix);
+                if (!d)
+                        return -ENOMEM;
+                *ret = d;
+                return 0;
+        }
+
+        default:
+                return -EINVAL;
+        }
+}
+
+int runtime_directory_generic(RuntimeScope scope, const char *suffix, char **ret) {
         assert(ret);
 
         /* This does not bother with $RUNTIME_DIRECTORY, and hence can be applied to get other service's
@@ -43,24 +65,19 @@ int runtime_directory_generic(RuntimeScope scope, const char *suffix, char **ret
 
         switch (scope) {
         case RUNTIME_SCOPE_USER:
-                r = xdg_user_runtime_dir(suffix, ret);
-                if (r < 0)
-                        return r;
-                break;
+                return xdg_user_runtime_dir(suffix, ret);
 
         case RUNTIME_SCOPE_SYSTEM: {
                 char *d = path_join("/run", suffix);
                 if (!d)
                         return -ENOMEM;
                 *ret = d;
-                break;
+                return 0;
         }
 
         default:
                 return -EINVAL;
         }
-
-        return 0;
 }
 
 int runtime_directory(RuntimeScope scope, const char *fallback_suffix, char **ret) {
@@ -83,6 +100,68 @@ int runtime_directory(RuntimeScope scope, const char *fallback_suffix, char **re
                 return r;
 
         return 1;
+}
+
+int runtime_directory_make(RuntimeScope scope, const char *subdir, char **ret_dir, char **ret_dir_destroy) {
+        _cleanup_free_ char *dir = NULL, *destroy = NULL;
+        int r;
+
+        assert(subdir);
+        assert(ret_dir);
+        assert(ret_dir_destroy);
+
+        /* Use runtime_directory() (not _generic()) so that when we run in a systemd service
+         * with RuntimeDirectory= set, we pick up $RUNTIME_DIRECTORY and place our stuff into the
+         * directory the service manager prepared for us. When the env var is unset, we fall back
+         * to the provided subdirectory under /run (or the $XDG_RUNTIME_DIR equivalent in user scope)
+         * and take care of creation and destruction ourselves. */
+        r = runtime_directory(scope, subdir, &dir);
+        if (r < 0)
+                return r;
+
+        if (r > 0) {
+                /* $RUNTIME_DIRECTORY was not set, so we got the fallback path and need to create and
+                 * clean up the directory ourselves. */
+                destroy = strdup(dir);
+                if (!destroy)
+                        return -ENOMEM;
+
+                r = mkdir_p(dir, 0755);
+                if (r < 0)
+                        return r;
+        }
+
+        /* When $RUNTIME_DIRECTORY is set the service manager created the directory for us and
+         * will destroy it (or preserve it, per RuntimeDirectoryPreserve=) when the service stops. */
+
+        *ret_dir = TAKE_PTR(dir);
+        *ret_dir_destroy = TAKE_PTR(destroy);
+
+        return 0;
+}
+
+int state_directory_generic(RuntimeScope scope, const char *suffix, char **ret) {
+        assert(ret);
+
+        /* This does not bother with $STATE_DIRECTORY, and hence can be applied to get other service's state
+         * dir */
+
+        switch (scope) {
+
+        case RUNTIME_SCOPE_USER:
+                return xdg_user_state_dir(suffix, ret);
+
+        case RUNTIME_SCOPE_SYSTEM: {
+                char *d = path_join("/var/lib", suffix);
+                if (!d)
+                        return -ENOMEM;
+                *ret = d;
+                return 0;
+        }
+
+        default:
+                return -EINVAL;
+        }
 }
 
 static const char* const user_data_unit_paths[] = {
@@ -215,7 +294,7 @@ static int acquire_lookup_dirs(
                 },
                 [LOOKUP_DIR_ATTACHED] = {
                         [RUNTIME_SCOPE_SYSTEM] = { "/etc/systemd/system.attached", "/run/systemd/system.attached" },
-                        /* Portable services are not available to regular users for now. */
+                        [RUNTIME_SCOPE_USER]   = { "systemd/user.attached",        "systemd/user.attached"        },
                 },
         };
 
@@ -333,7 +412,9 @@ static int get_paths_from_environ(const char *var, char ***ret) {
 
 static char** user_unit_search_dirs(
                 const char *persistent_config,
+                const char *persistent_attached,
                 const char *runtime_config,
+                const char *runtime_attached,
                 const char *global_persistent_config,
                 const char *global_runtime_config,
                 const char *generator,
@@ -348,6 +429,7 @@ static char** user_unit_search_dirs(
         /* The returned strv might contain duplicates, and we expect caller to filter them. */
 
         assert(persistent_config);
+        assert(persistent_attached);
         assert(global_persistent_config);
         assert(global_runtime_config);
         assert(persistent_control);
@@ -359,28 +441,30 @@ static char** user_unit_search_dirs(
                          STRV_IFNOTNULL(runtime_control),
                          STRV_IFNOTNULL(transient),
                          STRV_IFNOTNULL(generator_early),
-                         persistent_config);
+                         persistent_config,
+                         persistent_attached);
         if (!paths)
                 return NULL;
 
-        if (strv_extend_strv_consume(&paths, TAKE_PTR(config_dirs), /* filter_duplicates = */ false) < 0)
+        if (strv_extend_strv_consume(&paths, TAKE_PTR(config_dirs), /* filter_duplicates= */ false) < 0)
                 return NULL;
 
         /* global config has lower priority than the user config of the same type */
         if (strv_extend(&paths, global_persistent_config) < 0)
                 return NULL;
 
-        if (strv_extend_strv(&paths, (char* const*) user_config_unit_paths, /* filter_duplicates = */ false) < 0)
+        if (strv_extend_strv(&paths, (char* const*) user_config_unit_paths, /* filter_duplicates= */ false) < 0)
                 return NULL;
 
         /* strv_extend_many() can deal with NULL-s in arguments */
         if (strv_extend_many(&paths,
                              runtime_config,
+                             runtime_attached,
                              global_runtime_config,
                              generator) < 0)
                 return NULL;
 
-        if (strv_extend_strv_consume(&paths, TAKE_PTR(data_dirs), /* filter_duplicates = */ false) < 0)
+        if (strv_extend_strv_consume(&paths, TAKE_PTR(data_dirs), /* filter_duplicates= */ false) < 0)
                 return NULL;
 
         if (strv_extend_strv(&paths, (char* const*) user_data_unit_paths, false) < 0)
@@ -535,7 +619,8 @@ int lookup_paths_init(
                         break;
 
                 case RUNTIME_SCOPE_USER:
-                        add = user_unit_search_dirs(persistent_config, runtime_config,
+                        add = user_unit_search_dirs(persistent_config, persistent_attached,
+                                                    runtime_config, runtime_attached,
                                                     global_persistent_config, global_runtime_config,
                                                     generator, generator_early, generator_late,
                                                     transient,
@@ -550,7 +635,7 @@ int lookup_paths_init(
                         return -ENOMEM;
 
                 /* strv_uniq() below would filter all duplicates against the final strv */
-                r = strv_extend_strv_consume(&paths, TAKE_PTR(add), /* filter_duplicates = */ false);
+                r = strv_extend_strv_consume(&paths, TAKE_PTR(add), /* filter_duplicates= */ false);
                 if (r < 0)
                         return r;
         }
@@ -731,7 +816,7 @@ char** generator_binary_paths_internal(RuntimeScope scope, bool env_generator) {
                 return NULL;
 
         if (!paths || r > 0) {
-                r = strv_extend_strv(&paths, (char* const*) generator_paths, /* filter_duplicates = */ true);
+                r = strv_extend_strv(&paths, (char* const*) generator_paths, /* filter_duplicates= */ true);
                 if (r < 0)
                         return NULL;
         }

@@ -221,6 +221,7 @@ static int add_swap(
 
         _cleanup_free_ char *name = NULL;
         _cleanup_fclose_ FILE *f = NULL;
+        bool is_network;
         int r;
 
         assert(what);
@@ -240,11 +241,14 @@ static int add_swap(
                 return true;
         }
 
-        log_debug("Found swap entry what=%s makefs=%s growfs=%s pcrfs=%s validatefs=%s noauto=%s nofail=%s",
+        is_network = fstab_test_option(options, "_netdev\0");
+
+        log_debug("Found swap entry what=%s makefs=%s growfs=%s pcrfs=%s validatefs=%s noauto=%s nofail=%s netdev=%s",
                   what,
                   yes_no(flags & MOUNT_MAKEFS), yes_no(flags & MOUNT_GROWFS),
                   yes_no(flags & MOUNT_PCRFS), yes_no(flags & MOUNT_VALIDATEFS),
-                  yes_no(flags & MOUNT_NOAUTO), yes_no(flags & MOUNT_NOFAIL));
+                  yes_no(flags & MOUNT_NOAUTO), yes_no(flags & MOUNT_NOFAIL),
+                  yes_no(is_network));
 
         r = unit_name_from_path(what, ".swap", &name);
         if (r < 0)
@@ -285,6 +289,12 @@ static int add_swap(
         if (r < 0)
                 return r;
 
+        if (is_network) {
+                r = generator_write_network_device_deps(arg_dest, what, /* where= */ NULL, options);
+                if (r < 0)
+                        return r;
+        }
+
         if (flags & MOUNT_MAKEFS) {
                 r = generator_hook_up_mkswap(arg_dest, what);
                 if (r < 0)
@@ -300,7 +310,8 @@ static int add_swap(
                 log_warning("%s: validating swap devices is currently unsupported.", what);
 
         if (!(flags & MOUNT_NOAUTO)) {
-                r = generator_add_symlink(arg_dest, SPECIAL_SWAP_TARGET,
+                const char *target = is_network ? SPECIAL_REMOTE_FS_TARGET : SPECIAL_SWAP_TARGET;
+                r = generator_add_symlink(arg_dest, target,
                                           (flags & MOUNT_NOFAIL) ? "wants" : "requires", name);
                 if (r < 0)
                         return r;
@@ -672,9 +683,9 @@ static int add_mount(
         }
 
         if (flags & MOUNT_PCRFS) {
-                r = efi_measured_uki(LOG_WARNING);
+                r = efi_measured_os(LOG_WARNING);
                 if (r == 0)
-                        log_debug("Kernel stub did not measure kernel image into PCR, skipping userspace measurement, too.");
+                        log_debug("OS measurements not explicitly requested and kernel stub did not measure kernel image into PCR, skipping userspace measurement, too.");
                 else if (r > 0) {
                         r = generator_hook_up_pcrfs(dest, where, target_unit);
                         if (r < 0)
@@ -693,7 +704,7 @@ static int add_mount(
                 if (r < 0) {
                         if (r != -EOPNOTSUPP)
                                 return r;
-                } else {
+                } else if (r > 0) {
                         r = generator_hook_up_quotaon(dest, where, target_unit);
                         if (r < 0)
                                 return r;
@@ -1039,7 +1050,7 @@ static int parse_fstab(bool prefix_sysroot) {
 
         log_debug("Parsing %s...", fstab);
 
-        r = libmount_parse_full(fstab, /* source = */ NULL, MNT_ITER_FORWARD, &table, &iter);
+        r = libmount_parse_full(fstab, /* source= */ NULL, MNT_ITER_FORWARD, &table, &iter);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -1062,8 +1073,8 @@ static int parse_fstab(bool prefix_sysroot) {
                                 sym_mnt_fs_get_options(fs),
                                 sym_mnt_fs_get_passno(fs),
                                 prefix_sysroot,
-                                /* accept_root = */ false,
-                                /* use_swap_enabled = */ true);
+                                /* accept_root= */ false,
+                                /* use_swap_enabled= */ true);
                 if (arg_sysroot_check && r > 0)
                         return true;  /* We found a mount or swap that would be started… */
                 RET_GATHER(ret, r);
@@ -1229,11 +1240,31 @@ static int add_sysroot_mount(void) {
                 if (!strextend_with_separator(&combined_options, ",", extra_opts))
                         return log_oom();
 
+        /* A bind mount inherits the mount flags (nosuid, nodev, noexec, …) of the file system the source
+         * directory is located on. The source typically lives below /run/ (e.g. a freshly unpacked tar image
+         * in /run/machines/), which is mounted nosuid,nodev, and these flags would then propagate to our root
+         * file system, breaking suid binaries (e.g. sudo) and device nodes. Since this is supposed to become a
+         * regular OS root file system, default to dev,suid,exec instead, unless the user explicitly requested
+         * otherwise. */
+        if (bind) {
+                static const char* const defaults[] = {
+                        "suid", "suid\0" "nosuid\0",
+                        "dev",  "dev\0"  "nodev\0",
+                        "exec", "exec\0" "noexec\0",
+                        NULL,
+                };
+
+                STRV_FOREACH_PAIR(add, test, defaults)
+                        if (!fstab_test_option(combined_options, *test))
+                                if (!strextend_with_separator(&combined_options, ",", *add))
+                                        return log_oom();
+        }
+
         log_debug("Found entry what=%s where=/sysroot type=%s opts=%s", what, strna(fstype), strempty(combined_options));
 
         /* Only honor x-systemd.makefs and .validatefs here, others are not relevant in initrd/not used
          * at all (also see mandatory_mount_drop_unapplicable_options()) */
-        flags = fstab_options_to_flags(combined_options, /* is_swap = */ false) & (MOUNT_MAKEFS|MOUNT_VALIDATEFS);
+        flags = fstab_options_to_flags(combined_options, /* is_swap= */ false) & (MOUNT_MAKEFS|MOUNT_VALIDATEFS);
 
         return add_mount("/proc/cmdline",
                          arg_dest,
@@ -1411,10 +1442,10 @@ static int add_mounts_from_cmdline(void) {
                                               m->where,
                                               m->fstype,
                                               m->options,
-                                              /* passno = */ -1,
-                                              /* prefix_sysroot = */ !m->for_initrd && in_initrd(),
-                                              /* accept_root = */ true,
-                                              /* use_swap_enabled = */ false));
+                                              /* passno= */ -1,
+                                              /* prefix_sysroot= */ !m->for_initrd && in_initrd(),
+                                              /* accept_root= */ true,
+                                              /* use_swap_enabled= */ false));
         }
 
         return r;
@@ -1463,8 +1494,8 @@ static int add_mounts_from_creds(bool prefix_sysroot) {
                                            sym_mnt_fs_get_options(fs),
                                            sym_mnt_fs_get_passno(fs),
                                            prefix_sysroot,
-                                           /* accept_root = */ true,
-                                           /* use_swap_enabled = */ true));
+                                           /* accept_root= */ true,
+                                           /* use_swap_enabled= */ true));
         }
 }
 
@@ -1655,7 +1686,7 @@ static int run_generator(void) {
         (void) determine_usr();
 
         if (arg_sysroot_check) {
-                r = parse_fstab(/* prefix_sysroot = */ true);
+                r = parse_fstab(/* prefix_sysroot= */ true);
                 if (r == 0)
                         log_debug("Nothing interesting found, not doing daemon-reload.");
                 if (r > 0)
@@ -1678,21 +1709,21 @@ static int run_generator(void) {
         /* Honour /etc/fstab only when that's enabled */
         if (arg_fstab_enabled) {
                 /* Parse the local /etc/fstab, possibly from the initrd */
-                RET_GATHER(r, parse_fstab(/* prefix_sysroot = */ false));
+                RET_GATHER(r, parse_fstab(/* prefix_sysroot= */ false));
 
                 /* If running in the initrd also parse the /etc/fstab from the host */
                 if (in_initrd())
-                        RET_GATHER(r, parse_fstab(/* prefix_sysroot = */ true));
+                        RET_GATHER(r, parse_fstab(/* prefix_sysroot= */ true));
                 else
                         RET_GATHER(r, generator_enable_remount_fs_service(arg_dest));
         }
 
         RET_GATHER(r, add_mounts_from_cmdline());
 
-        RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot = */ false));
+        RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot= */ false));
 
         if (in_initrd())
-                RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot = */ true));
+                RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot= */ true));
 
         return r;
 }

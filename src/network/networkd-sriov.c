@@ -3,6 +3,7 @@
 
 #include "sd-netlink.h"
 
+#include "device-private.h"
 #include "device-util.h"
 #include "errno-util.h"
 #include "hashmap.h"
@@ -282,7 +283,7 @@ int link_set_sr_iov_ifindices(Link *link) {
 
         /* This may return -EINVAL or -ENODEV, instead of -ENOENT, if the device has been removed or is being
          * removed. Let's ignore the error codes here. */
-        r = sd_device_get_sysattr_value(link->dev, "dev_port", &dev_port);
+        r = device_get_sysattr_safe_string(link->dev, "dev_port", &dev_port);
         if (ERRNO_IS_NEG_DEVICE_ABSENT(r) || r == -EINVAL)
                 return 0;
         if (r < 0)
@@ -345,7 +346,7 @@ bool check_ready_for_all_sr_iov_ports(
         /* If this is a VF port, then also check the PF port. */
         if (link->sr_iov_phys_port_ifindex > 0) {
                 if (link_get_by_index(link->manager, link->sr_iov_phys_port_ifindex, &phys_link) < 0 ||
-                    !check_one(phys_link, /* allow_unmanaged = */ true))
+                    !check_one(phys_link, /* allow_unmanaged= */ true))
                         return false;
         } else
                 phys_link = link;
@@ -361,7 +362,7 @@ bool check_ready_for_all_sr_iov_ports(
                 if (link_get_by_index(link->manager, ifindex, &virt_link) < 0)
                         return false;
 
-                if (!check_one(virt_link, /* allow_unmanaged = */ true))
+                if (!check_one(virt_link, /* allow_unmanaged= */ true))
                         return false;
         }
 

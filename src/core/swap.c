@@ -223,6 +223,7 @@ static int swap_add_device_dependencies(Swap *s) {
 }
 
 static int swap_add_default_dependencies(Swap *s) {
+        SwapParameters *p;
         int r;
 
         assert(s);
@@ -236,13 +237,46 @@ static int swap_add_default_dependencies(Swap *s) {
         if (detect_container() > 0)
                 return 0;
 
-        /* swap units generated for the swap dev links are missing the
-         * ordering dep against the swap target. */
-        r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_SWAP_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
-        if (r < 0)
-                return r;
+        p = swap_get_parameters(s);
 
-        return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+        if (p && fstab_test_option(p->options, "_netdev\0")) {
+                /* Network swap devices (those with _netdev in options) are routed through
+                 * remote-fs.target instead of swap.target, mirroring how network mounts use
+                 * remote-fs.target instead of local-fs.target. This avoids an ordering cycle:
+                 * swap.target is pulled in at sysinit.target time, but network-online.target
+                 * only comes after basic.target which is after sysinit.target. */
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_REMOTE_FS_PRE_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_REMOTE_FS_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+
+                /* Pull in and order after network-online.target, analogous to
+                 * mount_add_default_network_dependencies() for network mounts. */
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_NETWORK_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_two_dependencies_by_name(UNIT(s), UNIT_WANTS, UNIT_AFTER, SPECIAL_NETWORK_ONLINE_TARGET,
+                                                      /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+        } else {
+                /* swap units generated for the swap dev links are missing the
+                 * ordering dep against the swap target. */
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_SWAP_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+        }
+
+        return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET,
+                                                 /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
 }
 
 static int swap_verify(Swap *s) {
@@ -351,7 +385,7 @@ static int swap_load(Unit *u) {
         assert(u->load_state == UNIT_STUB);
 
         /* Load a .swap file */
-        r = unit_load_fragment_and_dropin(u, /* fragment_required = */ !s->from_proc_swaps);
+        r = unit_load_fragment_and_dropin(u, /* fragment_required= */ !s->from_proc_swaps);
 
         /* Add in some extras, and do so either when we successfully loaded something or when /proc/swaps is
          * already active. */
@@ -508,7 +542,7 @@ static void swap_set_state(Swap *s, SwapState state) {
         if (state != old_state)
                 log_unit_debug(UNIT(s), "Changed %s -> %s", swap_state_to_string(old_state), swap_state_to_string(state));
 
-        unit_notify(UNIT(s), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
+        unit_notify(UNIT(s), state_translation_table[old_state], state_translation_table[state], /* reload_success= */ true);
 
         /* If there other units for the same device node have a job
            queued it might be worth checking again if it is runnable
@@ -668,17 +702,17 @@ static int swap_spawn(Swap *s, ExecCommand *c, PidRef *ret_pid) {
 static void swap_enter_dead(Swap *s, SwapResult f) {
         assert(s);
 
-        if (s->result == SWAP_SUCCESS)
+        if (s->result == SWAP_SUCCESS || f == SWAP_FAILURE_START_LIMIT_HIT)
                 s->result = f;
 
         unit_log_result(UNIT(s), s->result == SWAP_SUCCESS, swap_result_to_string(s->result));
-        unit_warn_leftover_processes(UNIT(s), /* start = */ false);
+        unit_warn_leftover_processes(UNIT(s), /* start= */ false);
 
         swap_set_state(s, s->result != SWAP_SUCCESS ? SWAP_FAILED : SWAP_DEAD);
 
         s->exec_runtime = exec_runtime_destroy(s->exec_runtime);
 
-        unit_destroy_runtime_data(UNIT(s), &s->exec_context, /* destroy_runtime_dir = */ true);
+        unit_destroy_runtime_data(UNIT(s), &s->exec_context, /* destroy_runtime_dir= */ true);
 
         unit_unref_uid_gid(UNIT(s), true);
 }
@@ -755,7 +789,7 @@ static void swap_enter_activating(Swap *s) {
 
         assert(s);
 
-        unit_warn_leftover_processes(UNIT(s), /* start = */ true);
+        unit_warn_leftover_processes(UNIT(s), /* start= */ true);
 
         s->control_command_id = SWAP_EXEC_ACTIVATE;
         s->control_command = s->exec_command + SWAP_EXEC_ACTIVATE;
@@ -1427,6 +1461,8 @@ static int swap_get_timeout(Unit *u, usec_t *timeout) {
         usec_t t;
         int r;
 
+        assert(timeout);
+
         if (!s->timer_event_source)
                 return 0;
 
@@ -1580,6 +1616,7 @@ const UnitVTable swap_vtable = {
         .private_section = "Swap",
 
         .can_fail = true,
+        .track_orphaned = true,
 
         .init = swap_init,
         .load = swap_load,

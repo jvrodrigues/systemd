@@ -17,6 +17,7 @@
 #include "networkd-address.h"
 #include "networkd-address-generation.h"
 #include "networkd-dhcp6.h"
+#include "networkd-ipv6ll.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-ndisc.h"
@@ -91,7 +92,8 @@ bool link_ndisc_enabled(Link *link) {
 void network_adjust_ndisc(Network *network) {
         assert(network);
 
-        if (!FLAGS_SET(network->link_local, ADDRESS_FAMILY_IPV6)) {
+        if (!FLAGS_SET(network->link_local, ADDRESS_FAMILY_IPV6) &&
+            !network_has_static_ipv6ll_address(network)) {
                 if (network->ndisc > 0)
                         log_warning("%s: IPv6AcceptRA= is enabled but IPv6 link-local addressing is disabled or not supported. "
                                     "Disabling IPv6AcceptRA=.", network->filename);
@@ -501,7 +503,7 @@ static int ndisc_request_route(Route *route, Link *link) {
         if (r < 0)
                 return r;
 
-        r = ndisc_set_route_nexthop(route, link, /* request = */ true);
+        r = ndisc_set_route_nexthop(route, link, /* request= */ true);
         if (r < 0)
                 return r;
 
@@ -623,7 +625,7 @@ static int ndisc_remove_route(Route *route, Link *link) {
         assert(link);
         assert(link->manager);
 
-        r = ndisc_set_route_nexthop(route, link, /* request = */ false);
+        r = ndisc_set_route_nexthop(route, link, /* request= */ false);
         if (r < 0)
                 return r;
 
@@ -979,7 +981,7 @@ static int ndisc_redirect_handler(Link *link, sd_ndisc_redirect *rd) {
         if (r < 0)
                 return r;
 
-        r = ndisc_drop_outdated(link, /* router = */ NULL, now_usec);
+        r = ndisc_drop_outdated(link, /* router= */ NULL, now_usec);
         if (r < 0)
                 return r;
 
@@ -1909,6 +1911,8 @@ static int ndisc_router_process_dnssl(Link *link, sd_ndisc_router *rt, bool zero
                 _cleanup_free_ NDiscDNSSL *s = NULL;
                 NDiscDNSSL *dnssl;
 
+                /* Silence static analyzers */
+                assert(strlen(*j) <= SIZE_MAX - ALIGN(sizeof(NDiscDNSSL)) - 1);
                 s = malloc0(ALIGN(sizeof(NDiscDNSSL)) + strlen(*j) + 1);
                 if (!s)
                         return log_oom();
@@ -2522,7 +2526,7 @@ static int ndisc_expire_handler(sd_event_source *s, uint64_t usec, void *userdat
 
         assert_se(sd_event_now(link->manager->event, CLOCK_BOOTTIME, &now_usec) >= 0);
 
-        (void) ndisc_drop_outdated(link, /* router = */ NULL, now_usec);
+        (void) ndisc_drop_outdated(link, /* router= */ NULL, now_usec);
         (void) ndisc_setup_expire(link);
         return 0;
 }
@@ -2629,7 +2633,7 @@ static int ndisc_start_dhcp6_client(Link *link, sd_ndisc_router *rt) {
         case IPV6_ACCEPT_RA_START_DHCP6_CLIENT_ALWAYS:
                 /* When IPv6AcceptRA.DHCPv6Client=always, start dhcp6 client in solicit mode
                  * even if the router flags have neither M nor O flags. */
-                r = dhcp6_start_on_ra(link, /* information_request = */ false);
+                r = dhcp6_start_on_ra(link, /* information_request= */ false);
                 break;
 
         default:
@@ -2677,7 +2681,7 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return r;
 
-        r = ndisc_drop_outdated(link, /* router = */ NULL, timestamp_usec);
+        r = ndisc_drop_outdated(link, /* router= */ NULL, timestamp_usec);
         if (r < 0)
                 return r;
 
@@ -2705,7 +2709,7 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return r;
 
-        r = ndisc_router_process_options(link, rt, /* zero_lifetime = */ true);
+        r = ndisc_router_process_options(link, rt, /* zero_lifetime= */ true);
         if (r < 0)
                 return r;
 
@@ -2713,7 +2717,7 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return r;
 
-        r = ndisc_router_process_options(link, rt, /* zero_lifetime = */ false);
+        r = ndisc_router_process_options(link, rt, /* zero_lifetime= */ false);
         if (r < 0)
                 return r;
 
@@ -2999,7 +3003,7 @@ static int ndisc_process_request(Request *req, Link *link, void *userdata) {
 
         assert(link);
 
-        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return 0;
 
         r = ndisc_configure(link);
@@ -3074,7 +3078,7 @@ int link_drop_ndisc_config(Link *link, Network *network) {
         /* Redirect messages will be ignored. Drop configurations based on the previously received redirect
          * messages. */
         if (!network->ndisc_use_redirect)
-                (void) ndisc_drop_redirect(link, /* router = */ NULL);
+                (void) ndisc_drop_redirect(link, /* router= */ NULL);
 
         /* If one of the route setting is changed, drop all routes. */
         if (link->network->ndisc_use_gateway != network->ndisc_use_gateway ||
@@ -3143,8 +3147,8 @@ void ndisc_flush(Link *link) {
         assert(link);
 
         /* Remove all addresses, routes, RDNSS, DNSSL, DNR, and Captive Portal entries, without exception. */
-        (void) ndisc_drop_outdated(link, /* router = */ NULL, /* timestamp_usec = */ USEC_INFINITY);
-        (void) ndisc_drop_redirect(link, /* router = */ NULL);
+        (void) ndisc_drop_outdated(link, /* router= */ NULL, /* timestamp_usec= */ USEC_INFINITY);
+        (void) ndisc_drop_redirect(link, /* router= */ NULL);
 
         link->ndisc_routers_by_sender = hashmap_free(link->ndisc_routers_by_sender);
         link->ndisc_rdnss = set_free(link->ndisc_rdnss);

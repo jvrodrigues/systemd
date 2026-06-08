@@ -10,12 +10,14 @@
 
 #include "sd-bus.h"
 #include "sd-event.h"
+#include "sd-future.h"
 
 #include "af-list.h"
 #include "alloc-util.h"
 #include "bus-container.h"
 #include "bus-control.h"
 #include "bus-error.h"
+#include "bus-future.h"
 #include "bus-internal.h"
 #include "bus-kernel.h"
 #include "bus-label.h"
@@ -41,7 +43,6 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "prioq.h"
-#include "process-util.h"
 #include "set.h"
 #include "string-util.h"
 #include "strv.h"
@@ -223,6 +224,12 @@ static sd_bus* bus_free(sd_bus *b) {
         ordered_hashmap_free(b->reply_callbacks);
         prioq_free(b->reply_callbacks_prioq);
 
+        /* Outstanding fiber handlers pin the bus via their BusFiberData ref, so by the time refcount
+         * reaches zero and bus_free() runs, every fiber has already resolved and removed itself from
+         * this set. */
+        assert(set_isempty(b->fiber_futures));
+        set_free(b->fiber_futures);
+
         assert(b->match_callbacks.type == BUS_MATCH_ROOT);
         bus_match_free(&b->match_callbacks);
 
@@ -262,6 +269,7 @@ _public_ int sd_bus_new(sd_bus **ret) {
                 .creds_mask = SD_BUS_CREDS_WELL_KNOWN_NAMES|SD_BUS_CREDS_UNIQUE_NAME,
                 .accept_fd = true,
                 .origin_id = origin_id_query(),
+                .busexec_pidref = PIDREF_NULL,
                 .n_groups = SIZE_MAX,
                 .close_on_exit = true,
                 .ucred = UCRED_INVALID,
@@ -1121,13 +1129,6 @@ static int bus_parse_next_address(sd_bus *b) {
         return 1;
 }
 
-static void bus_kill_exec(sd_bus *bus) {
-        if (!pid_is_valid(bus->busexec_pid))
-                return;
-
-        sigterm_wait(TAKE_PID(bus->busexec_pid));
-}
-
 static int bus_start_address(sd_bus *b) {
         int r;
 
@@ -1136,7 +1137,7 @@ static int bus_start_address(sd_bus *b) {
         for (;;) {
                 bus_close_fds(b);
 
-                bus_kill_exec(b);
+                pidref_done_sigterm_wait(&b->busexec_pidref);
 
                 /* If you provide multiple different bus-addresses, we
                  * try all of them in order and use the first one that
@@ -1487,7 +1488,7 @@ int bus_set_address_system_remote(sd_bus *b, const char *host) {
                         got_forward_slash = true;
                 }
 
-                if (!in_charset(p, "0123456789") || *p == '\0') {
+                if (!in_charset(p, DIGITS) || *p == '\0') {
                         if (!hostname_is_valid(p, 0) || got_forward_slash)
                                 return -EINVAL;
 
@@ -1503,7 +1504,7 @@ int bus_set_address_system_remote(sd_bus *b, const char *host) {
 interpret_port_as_machine_old_syntax:
                 /* Let's make sure this is not a port of some kind,
                  * and is a valid machine name. */
-                if (!in_charset(m, "0123456789") && hostname_is_valid(m, 0))
+                if (!in_charset(m, DIGITS) && hostname_is_valid(m, 0))
                         c = strjoina(",argv", p ? "7" : "5", "=--machine=", m);
         }
 
@@ -1778,7 +1779,7 @@ _public_ void sd_bus_close(sd_bus *bus) {
                 return;
 
         /* Don't leave ssh hanging around */
-        bus_kill_exec(bus);
+        pidref_done_sigterm_wait(&bus->busexec_pidref);
 
         bus_set_state(bus, BUS_CLOSED);
 
@@ -1809,13 +1810,16 @@ _public_ sd_bus* sd_bus_flush_close_unref(sd_bus *bus) {
                 return NULL;
 
         /* Have to do this before flush() to prevent hang */
-        bus_kill_exec(bus);
+        pidref_done_sigterm_wait(&bus->busexec_pidref);
         sd_bus_flush(bus);
 
         return sd_bus_close_unref(bus);
 }
 
 void bus_enter_closing(sd_bus *bus, int exit_code) {
+        sd_future *f;
+        int r;
+
         assert(bus);
 
         if (!IN_SET(bus->state, BUS_WATCH_BIND, BUS_OPENING, BUS_AUTHENTICATING, BUS_HELLO, BUS_RUNNING))
@@ -1823,6 +1827,19 @@ void bus_enter_closing(sd_bus *bus, int exit_code) {
 
         bus_set_state(bus, BUS_CLOSING);
         bus->exit_code = exit_code;
+
+        /* Cancel all outstanding fiber-dispatched method handlers. Most cancellations are scheduled
+         * asynchronously (fibers resolve with -ECANCELED the next time they run), but a fiber still
+         * in FIBER_STATE_INITIAL resolves synchronously, which fires bus_fiber_resolved() and
+         * removes f from this set mid-iteration. That's safe because SET_FOREACH permits removal of
+         * exactly the current entry — see the assertion in hashmap_iterate_entry(). Either way this
+         * doesn't block here: process_closing() waits for the fiber_futures set to drain before it
+         * continues tearing down the rest of the bus. */
+        SET_FOREACH(f, bus->fiber_futures) {
+                r = sd_future_cancel(f);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to cancel outstanding fiber method handler, ignoring: %m");
+        }
 }
 
 /* Define manually so we can add the PID check */
@@ -2028,6 +2045,7 @@ static int bus_write_message(sd_bus *bus, sd_bus_message *m, size_t *idx) {
 
         assert(bus);
         assert(m);
+        assert(idx);
 
         r = bus_socket_write_message(bus, m, idx);
         if (r <= 0)
@@ -2394,22 +2412,29 @@ _public_ int sd_bus_call(
                 sd_bus_error *reterr_error,
                 sd_bus_message **ret_reply) {
 
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = sd_bus_message_ref(_m);
         usec_t timeout;
         uint64_t cookie;
         size_t i;
         int r;
 
-        bus_assert_return(m, -EINVAL, reterr_error);
-        bus_assert_return(m->header->type == SD_BUS_MESSAGE_METHOD_CALL, -EINVAL, reterr_error);
-        bus_assert_return(!(m->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED), -EINVAL, reterr_error);
+        bus_assert_return(_m, -EINVAL, reterr_error);
+        bus_assert_return(_m->header->type == SD_BUS_MESSAGE_METHOD_CALL, -EINVAL, reterr_error);
+        bus_assert_return(!(_m->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED), -EINVAL, reterr_error);
         bus_assert_return(!bus_error_is_dirty(reterr_error), -EINVAL, reterr_error);
 
         if (bus)
                 assert_return(bus = bus_resolve(bus), -ENOPKG);
         else
-                assert_return(bus = m->bus, -ENOTCONN);
+                assert_return(bus = _m->bus, -ENOTCONN);
         bus_assert_return(!bus_origin_changed(bus), -ECHILD, reterr_error);
+
+        /* If the current fiber and the bus share their event loop, we can use sd_bus_call_suspend()
+         * instead which does an async method call. This allows multiple invocations of sd_bus_call() to
+         * happen across multiple fibers at once. */
+        if (sd_fiber_is_running() && bus->event == sd_fiber_get_event())
+                return bus_call_suspend(bus, _m, usec, reterr_error, ret_reply);
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = sd_bus_message_ref(_m);
 
         if (!BUS_IS_OPEN(bus->state)) {
                 r = -ENOTCONN;
@@ -3183,7 +3208,14 @@ static int process_closing(sd_bus *bus, sd_bus_message **ret) {
         assert(bus);
         assert(bus->state == BUS_CLOSING);
 
-        /* First, fail all outstanding method calls */
+        /* Wait for any still-running fiber method handlers to finish unwinding their cancellation
+         * before tearing down the rest of the bus. bus_enter_closing() scheduled the cancel; each
+         * fiber resolves asynchronously and bus_fiber_resolved() removes it from the set. Returning
+         * 1 here keeps the bus in CLOSING state so the event loop drives the fibers to completion. */
+        if (!set_isempty(bus->fiber_futures))
+                return 1;
+
+        /* Then, fail all outstanding method calls */
         c = ordered_hashmap_first(bus->reply_callbacks);
         if (c)
                 return process_closing_reply_callback(bus, c);
@@ -3490,10 +3522,13 @@ static int add_match_callback(
         sd_bus_slot_ref(match_slot);
 
         if (sd_bus_message_is_method_error(m, NULL)) {
-                r = log_debug_errno(sd_bus_message_get_errno(m),
+                const sd_bus_error *e = ASSERT_PTR(sd_bus_message_get_error(m));
+                r = sd_bus_error_get_errno(e);
+
+                r = log_debug_errno(r,
                                     "Unable to add match %s, failing connection: %s",
                                     match_slot->match_callback.match_string,
-                                    sd_bus_message_get_error(m)->message);
+                                    bus_error_message(e, r));
 
                 failed = true;
         } else

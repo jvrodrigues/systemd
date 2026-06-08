@@ -358,6 +358,7 @@ _public_ int sd_bus_creds_get_tid(sd_bus_creds *c, pid_t *ret) {
 
 _public_ int sd_bus_creds_get_selinux_context(sd_bus_creds *c, const char **ret) {
         assert_return(c, -EINVAL);
+        assert_return(ret, -EINVAL);
 
         if (!(c->mask & SD_BUS_CREDS_SELINUX_CONTEXT))
                 return -ENODATA;
@@ -949,7 +950,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, PidRef *pidref, pid_t tid
                                                         unsigned long g;
                                                         int n = 0;
 
-                                                        p = skip_leading_chars(p, /* bad = */ NULL);
+                                                        p = skip_leading_chars(p, /* bad= */ NULL);
                                                         if (*p == 0)
                                                                 break;
 

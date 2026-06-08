@@ -39,7 +39,7 @@
 #include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
-#include "selinux-access.h"
+#include "selinux-access.h"     /* IWYU pragma: keep */
 #include "serialize.h"
 #include "set.h"
 #include "special.h"
@@ -128,7 +128,7 @@ static int signal_activation_request(sd_bus_message *message, void *userdata, sd
                 goto failed;
         }
 
-        r = manager_add_job(m, JOB_START, u, JOB_REPLACE, &error, /* ret = */ NULL);
+        r = manager_add_job(m, JOB_START, u, JOB_REPLACE, &error, /* ret= */ NULL);
         if (r < 0)
                 goto failed;
 
@@ -229,6 +229,7 @@ static int find_unit(Manager *m, sd_bus *bus, const char *path, Unit **unit, sd_
         assert(m);
         assert(bus);
         assert(path);
+        assert(unit);
 
         if (streq(path, "/org/freedesktop/systemd1/unit/self")) {
                 _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
@@ -1059,7 +1060,7 @@ int bus_fdset_add_all(Manager *m, FDSet *fds) {
 
         /* When we are about to reexecute we add all D-Bus fds to the
          * set to pass over to the newly executed systemd. They won't
-         * be used there however, except thatt they are closed at the
+         * be used there however, except that they are closed at the
          * very end of deserialization, those making it possible for
          * clients to synchronously wait for systemd to reexec by
          * simply waiting for disconnection */

@@ -3,13 +3,20 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include "sd-device.h"
+#include "sd-dlopen.h"
+
 #include "alloc-util.h"
 #include "ansi-color.h"
 #include "bitfield.h"
 #include "boot-entry.h"
+#include "chase.h"
 #include "constants.h"
 #include "creds-util.h"
+#include "crypto-util.h"
 #include "cryptsetup-util.h"
+#include "device-private.h"
+#include "device-util.h"
 #include "dirent-util.h"
 #include "dlfcn-util.h"
 #include "efi-api.h"
@@ -42,17 +49,10 @@
 #include "time-util.h"
 #include "tpm2-pcr.h"
 #include "tpm2-util.h"
+#include "unaligned.h"
 #include "virt.h"
 
-#if HAVE_OPENSSL
-#  include <openssl/hmac.h>
-#endif
-
 #if HAVE_TPM2
-static void *libtss2_esys_dl = NULL;
-static void *libtss2_rc_dl = NULL;
-static void *libtss2_mu_dl = NULL;
-
 static DLSYM_PROTOTYPE(Esys_Create) = NULL;
 static DLSYM_PROTOTYPE(Esys_CreateLoaded) = NULL;
 static DLSYM_PROTOTYPE(Esys_CreatePrimary) = NULL;
@@ -120,16 +120,14 @@ static DLSYM_PROTOTYPE(Tss2_MU_UINT32_Marshal) = NULL;
 
 static DLSYM_PROTOTYPE(Tss2_RC_Decode) = NULL;
 
-static int dlopen_tpm2_esys(void) {
+static int dlopen_tpm2_esys(int log_level) {
+        static void *libtss2_esys_dl = NULL;
         int r;
 
-        ELF_NOTE_DLOPEN("tpm",
-                        "Support for TPM",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libtss2-esys.so.0");
+        TPM2_ESYS_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
 
         r = dlopen_many_sym_or_warn(
-                        &libtss2_esys_dl, "libtss2-esys.so.0", LOG_DEBUG,
+                        &libtss2_esys_dl, "libtss2-esys.so.0", log_level,
                         DLSYM_ARG(Esys_Create),
                         DLSYM_ARG(Esys_CreateLoaded),
                         DLSYM_ARG(Esys_CreatePrimary),
@@ -185,25 +183,23 @@ static int dlopen_tpm2_esys(void) {
         return 0;
 }
 
-static int dlopen_tpm2_rc(void) {
-        ELF_NOTE_DLOPEN("tpm",
-                        "Support for TPM",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libtss2-rc.so.0");
+static int dlopen_tpm2_rc(int log_level) {
+        static void *libtss2_rc_dl = NULL;
+
+        TPM2_RC_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
 
         return dlopen_many_sym_or_warn(
-                        &libtss2_rc_dl, "libtss2-rc.so.0", LOG_DEBUG,
+                        &libtss2_rc_dl, "libtss2-rc.so.0", log_level,
                         DLSYM_ARG(Tss2_RC_Decode));
 }
 
-static int dlopen_tpm2_mu(void) {
-        ELF_NOTE_DLOPEN("tpm",
-                        "Support for TPM",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libtss2-mu.so.0");
+static int dlopen_tpm2_mu(int log_level) {
+        static void *libtss2_mu_dl = NULL;
+
+        TPM2_MU_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
 
         return dlopen_many_sym_or_warn(
-                        &libtss2_mu_dl, "libtss2-mu.so.0", LOG_DEBUG,
+                        &libtss2_mu_dl, "libtss2-mu.so.0", log_level,
                         DLSYM_ARG(Tss2_MU_TPM2_CC_Marshal),
                         DLSYM_ARG(Tss2_MU_TPM2_HANDLE_Marshal),
                         DLSYM_ARG(Tss2_MU_TPM2B_DIGEST_Marshal),
@@ -225,27 +221,46 @@ static int dlopen_tpm2_mu(void) {
                         DLSYM_ARG(Tss2_MU_UINT32_Marshal));
 }
 
+static int dlopen_tpm2_tcti_device(int log_level) {
+        static void *libtss2_tcti_device_dl = NULL;
+
+        /* The "device" TCTI is the most relevant one, let's also load it explicitly on dlopen_tpm2(), even
+         * if we don't resolve any symbols here. */
+
+        TPM2_TCTI_DEVICE_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+
+        return dlopen_verbose(
+                        &libtss2_tcti_device_dl,
+                        "libtss2-tcti-device.so.0",
+                        log_level);
+}
+
 #endif
 
-int dlopen_tpm2(void) {
+int dlopen_tpm2(int log_level) {
 #if HAVE_TPM2
         int r;
 
-        r = dlopen_tpm2_esys();
+        r = dlopen_tpm2_esys(log_level);
         if (r < 0)
                 return r;
 
-        r = dlopen_tpm2_rc();
+        r = dlopen_tpm2_rc(log_level);
         if (r < 0)
                 return r;
 
-        r = dlopen_tpm2_mu();
+        r = dlopen_tpm2_mu(log_level);
+        if (r < 0)
+                return r;
+
+        r = dlopen_tpm2_tcti_device(log_level);
         if (r < 0)
                 return r;
 
         return 0;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "TPM2 support is not compiled in.");
 #endif
 }
 
@@ -326,6 +341,151 @@ static int tpm2_get_capability(
                 *ret_capability_data = capabilities->data;
 
         return more == TPM2_YES;
+}
+
+int tpm2_vendor_info_to_modalias(const Tpm2VendorInfo *info, char **ret) {
+        _cleanup_free_ char *m = NULL;
+
+        assert(info);
+        assert(ret);
+
+        /* Closely inspired by kernel modalias strings, this distills information from the TPM vendor data
+         * into a string suitable for matching hwdb */
+
+        if (asprintf(&m,
+                     "fi%s:"
+                     "lv%" PRIu32 ":"
+                     "rv%" PRIu32 ".%" PRIu32 ":"
+                     "sy%" PRIu32 ":"
+                     "sd%" PRIu32 ":"
+                     "mf%s:"
+                     "vs%s:"
+                     "ty%" PRIx32 ":"
+                     "fw%" PRIu16 ".%" PRIu16 ".%" PRIu32 ":",
+                     info->family_indicator,
+                     info->level,
+                     info->revision_major,
+                     info->revision_minor,
+                     info->year,
+                     info->day_of_year,
+                     info->manufacturer,
+                     info->vendor_string,
+                     info->vendor_tpm_type,
+                     info->firmware_version_major,
+                     info->firmware_version_minor,
+                     info->firmware_version2) < 0)
+                return -ENOMEM;
+
+        *ret = TAKE_PTR(m);
+        return 0;
+}
+
+static char *mangle_vendor_chars(char *c, size_t n) {
+        char *end = c;
+        assert(c || n == 0);
+
+        /* Suppress all control characters, whitespace and non-ASCII bytes */
+        for (char *x = c; x < c + n; x++) {
+                if (!IN_SET(*x, ' ', 0))
+                        end = x + 1;
+
+                if ((unsigned char) *x <= (unsigned char) ' ' ||
+                    (unsigned char) *x >= 127)
+                        *x = '_';
+        }
+
+        /* Drop trailing spaces and NUL bytes */
+        *end = 0;
+        return c;
+}
+
+int tpm2_get_vendor_info(
+                Tpm2Context *c,
+                Tpm2VendorInfo *ret) {
+
+        int r;
+
+        assert(c);
+        assert(ret);
+
+        TPMU_CAPABILITIES capabilities = {};
+        r = tpm2_get_capability(
+                        c,
+                        TPM2_CAP_TPM_PROPERTIES,
+                        TPM2_PT_FAMILY_INDICATOR,
+                        TPM2_PT_FIRMWARE_VERSION_2 - TPM2_PT_FAMILY_INDICATOR + 1, /* get all relevant fields at once */
+                        &capabilities);
+        if (r < 0)
+                return r;
+
+        Tpm2VendorInfo info = {};
+
+        for (uint32_t i = 0; i < capabilities.tpmProperties.count; i++) {
+                TPMS_TAGGED_PROPERTY *p = capabilities.tpmProperties.tpmProperty + i;
+
+                switch (p->property) {
+
+                case TPM2_PT_FAMILY_INDICATOR:
+                        unaligned_write_be32(info.family_indicator, p->value);
+                        mangle_vendor_chars(info.family_indicator, sizeof(info.family_indicator));
+                        break;
+
+                case TPM2_PT_LEVEL:
+                        info.level = p->value;
+                        break;
+
+                case TPM2_PT_REVISION:
+                        info.revision_major = p->value / 100;
+                        info.revision_minor = p->value % 100;
+                        break;
+
+                case TPM2_PT_DAY_OF_YEAR:
+                        info.day_of_year = p->value;
+                        break;
+
+                case TPM2_PT_YEAR:
+                        info.year = p->value;
+                        break;
+
+                case TPM2_PT_MANUFACTURER:
+                        unaligned_write_be32(info.manufacturer, p->value);
+                        mangle_vendor_chars(info.manufacturer, sizeof(info.manufacturer));
+                        break;
+
+                case TPM2_PT_VENDOR_STRING_1:
+                        unaligned_write_be32(info.vendor_string+0, p->value);
+                        break;
+
+                case TPM2_PT_VENDOR_STRING_2:
+                        unaligned_write_be32(info.vendor_string+4, p->value);
+                        break;
+
+                case TPM2_PT_VENDOR_STRING_3:
+                        unaligned_write_be32(info.vendor_string+8, p->value);
+                        break;
+
+                case TPM2_PT_VENDOR_STRING_4:
+                        unaligned_write_be32(info.vendor_string+12, p->value);
+                        break;
+
+                case TPM2_PT_VENDOR_TPM_TYPE:
+                        info.vendor_tpm_type = p->value;
+                        break;
+
+                case TPM2_PT_FIRMWARE_VERSION_1:
+                        info.firmware_version_major = p->value >> 16;
+                        info.firmware_version_minor = p->value & 0xFFFFU;
+                        break;
+
+                case TPM2_PT_FIRMWARE_VERSION_2:
+                        info.firmware_version2 = p->value;
+                        break;
+                }
+        }
+
+        mangle_vendor_chars(info.vendor_string, sizeof(info.vendor_string));
+        *ret = TAKE_STRUCT(info);
+        return 0;
 }
 
 #define TPMA_CC_TO_TPM2_CC(cca) (((cca) & TPMA_CC_COMMANDINDEX_MASK) >> TPMA_CC_COMMANDINDEX_SHIFT)
@@ -645,7 +805,7 @@ static bool tpm2_supports_tpmt_sym_def(Tpm2Context *c, const TPMT_SYM_DEF *param
         assert(c);
         assert(parameters);
 
-        /* Unfortunately, TPMT_SYM_DEF and TPMT_SYM_DEF_OBEJECT are separately defined, even though they are
+        /* Unfortunately, TPMT_SYM_DEF and TPMT_SYM_DEF_OBJECT are separately defined, even though they are
          * functionally identical. */
         TPMT_SYM_DEF_OBJECT object = {
                 .algorithm = parameters->algorithm,
@@ -669,6 +829,9 @@ static Tpm2Context *tpm2_context_free(Tpm2Context *c) {
         c->capability_algorithms = mfree(c->capability_algorithms);
         c->capability_commands = mfree(c->capability_commands);
         c->capability_ecc_curves = mfree(c->capability_ecc_curves);
+
+        c->tcti_driver = mfree(c->tcti_driver);
+        c->tcti_param = mfree(c->tcti_param);
 
         return mfree(c);
 }
@@ -696,9 +859,9 @@ int tpm2_context_new(const char *device, Tpm2Context **ret_context) {
                 .n_ref = 1,
         };
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         if (!device) {
                 device = secure_getenv("SYSTEMD_TPM2_DEVICE");
@@ -715,7 +878,8 @@ int tpm2_context_new(const char *device, Tpm2Context **ret_context) {
         }
 
         if (device) {
-                const char *param, *driver, *fn;
+                _cleanup_free_ char *_driver = NULL;
+                const char *param, *driver;
                 const TSS2_TCTI_INFO* info;
                 TSS2_TCTI_INFO_FUNC func;
                 size_t sz = 0;
@@ -723,7 +887,9 @@ int tpm2_context_new(const char *device, Tpm2Context **ret_context) {
                 param = strchr(device, ':');
                 if (param) {
                         /* Syntax #1: Pair of driver string and arbitrary parameter */
-                        driver = strndupa_safe(device, param - device);
+                        driver = _driver = strndup(device, param - device);
+                        if (!driver)
+                                return log_oom_debug();
                         if (isempty(driver))
                                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "TPM2 driver name is empty, refusing.");
 
@@ -737,7 +903,9 @@ int tpm2_context_new(const char *device, Tpm2Context **ret_context) {
 
                 log_debug("Using TPM2 TCTI driver '%s' with device '%s'.", driver, param);
 
-                fn = strjoina("libtss2-tcti-", driver, ".so.0");
+                _cleanup_free_ char *fn = strjoin("libtss2-tcti-", driver, ".so.0");
+                if (!fn)
+                        return log_oom_debug();
 
                 /* Better safe than sorry, let's refuse strings that cannot possibly be valid driver early, before going to disk. */
                 if (!filename_is_valid(fn))
@@ -777,6 +945,14 @@ int tpm2_context_new(const char *device, Tpm2Context **ret_context) {
                 if (rc != TPM2_RC_SUCCESS)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                                "Failed to initialize TCTI context: %s", sym_Tss2_RC_Decode(rc));
+
+                context->tcti_driver = strdup(driver);
+                if (!context->tcti_driver)
+                        return log_oom_debug();
+
+                context->tcti_param = strdup(param);
+                if (!context->tcti_param)
+                        return log_oom_debug();
         }
 
         rc = sym_Esys_Initialize(&context->esys_context, context->tcti_context, NULL);
@@ -2316,7 +2492,7 @@ static int tpm2_load_external(
 }
 
 static int tpm2_marshal_private(const TPM2B_PRIVATE *private, void **ret, size_t *ret_size) {
-        size_t max_size = sizeof(*private), blob_size = 0;
+        size_t max_size = SIZEOF(*private), blob_size = 0;
         _cleanup_free_ void *blob = NULL;
         TSS2_RC rc;
 
@@ -2359,7 +2535,7 @@ static int tpm2_unmarshal_private(const void *data, size_t size, TPM2B_PRIVATE *
 }
 
 int tpm2_marshal_public(const TPM2B_PUBLIC *public, void **ret, size_t *ret_size) {
-        size_t max_size = sizeof(*public), blob_size = 0;
+        size_t max_size = SIZEOF(*public), blob_size = 0;
         _cleanup_free_ void *blob = NULL;
         TSS2_RC rc;
 
@@ -2402,7 +2578,7 @@ static int tpm2_unmarshal_public(const void *data, size_t size, TPM2B_PUBLIC *re
 }
 
 int tpm2_marshal_nv_public(const TPM2B_NV_PUBLIC *nv_public, void **ret, size_t *ret_size) {
-        size_t max_size = sizeof(*nv_public), blob_size = 0;
+        size_t max_size = SIZEOF(*nv_public), blob_size = 0;
         _cleanup_free_ void *blob = NULL;
         TSS2_RC rc;
 
@@ -2701,13 +2877,15 @@ int tpm2_get_best_pcr_bank(
         uint32_t efi_banks;
         r = efi_get_active_pcr_banks(&efi_banks);
         if (r < 0) {
-                if (r != -ENOENT)
+                if (!IN_SET(r, -ENOENT, -EOPNOTSUPP))
                         return r;
 
                 /* If variable is not set use guesswork below */
-                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable, we have to guess the used PCR banks.");
+                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable or EFI support is unavailable, we have to guess the used PCR banks.");
         } else if (efi_banks == UINT32_MAX)
                 log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to indicate that the GetActivePcrBanks() API is not available in the firmware. We have to guess the used PCR banks.");
+        else if (efi_banks == 0)
+                log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to zero to indicate that TPM support is not available in the firmware. We'll have to guess the used PCR banks.");
         else {
                 if (BIT_SET(efi_banks, TPM2_ALG_SHA256))
                         *ret = TPM2_ALG_SHA256;
@@ -2810,13 +2988,15 @@ int tpm2_get_good_pcr_banks(
         uint32_t efi_banks;
         r = efi_get_active_pcr_banks(&efi_banks);
         if (r < 0) {
-                if (r != -ENOENT)
+                if (!IN_SET(r, -ENOENT, -EOPNOTSUPP))
                         return r;
 
                 /* If the variable is not set we have to guess via the code below */
-                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable, we have to guess the used PCR banks.");
+                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable or EFI support is unavailable, we have to guess the used PCR banks.");
         } else if (efi_banks == UINT32_MAX)
                 log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to indicate that the GetActivePcrBanks() API is not available in the firmware. We have to guess the used PCR banks.");
+        else if (efi_banks == 0)
+                log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to zero to indicate that TPM support is not available in the firmware. We'll have to guess the used PCR banks.");
         else {
                 FOREACH_ARRAY(hash, tpm2_hash_algorithms, TPM2_N_HASH_ALGORITHMS) {
                         if (!BIT_SET(efi_banks, *hash))
@@ -2890,10 +3070,14 @@ int tpm2_get_good_pcr_banks_strv(
 #if HAVE_OPENSSL
         _cleanup_free_ TPMI_ALG_HASH *algs = NULL;
         _cleanup_strv_free_ char **l = NULL;
-        int n_algs;
+        int n_algs, r;
 
         assert(c);
         assert(ret);
+
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
         n_algs = tpm2_get_good_pcr_banks(c, pcr_mask, &algs);
         if (n_algs < 0)
@@ -2908,11 +3092,11 @@ int tpm2_get_good_pcr_banks_strv(
                 if (!salg)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "TPM2 operates with unknown PCR algorithm, can't measure.");
 
-                implementation = EVP_get_digestbyname(salg);
+                implementation = sym_EVP_get_digestbyname(salg);
                 if (!implementation)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "TPM2 operates with unsupported PCR algorithm, can't measure.");
 
-                n = strdup(ASSERT_PTR(EVP_MD_name(implementation)));
+                n = strdup(ASSERT_PTR(sym_EVP_MD_get0_name(implementation)));
                 if (!n)
                         return log_oom_debug();
 
@@ -3329,9 +3513,9 @@ int tpm2_calculate_pubkey_name(const TPMT_PUBLIC *public, TPM2B_NAME *ret_name) 
         assert(public);
         assert(ret_name);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         if (public->nameAlg != TPM2_ALG_SHA256)
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
@@ -3413,9 +3597,9 @@ int tpm2_calculate_nv_index_name(const TPMS_NV_PUBLIC *nvpublic, TPM2B_NAME *ret
         assert(nvpublic);
         assert(ret_name);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         if (nvpublic->nameAlg != TPM2_ALG_SHA256)
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
@@ -3469,9 +3653,9 @@ int tpm2_calculate_policy_auth_value(TPM2B_DIGEST *digest) {
         assert(digest);
         assert(digest->size == SHA256_DIGEST_SIZE);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         uint8_t buf[sizeof(command)];
         size_t offset = 0;
@@ -3530,9 +3714,9 @@ int tpm2_calculate_policy_signed(TPM2B_DIGEST *digest, const TPM2B_NAME *name) {
         assert(digest->size == SHA256_DIGEST_SIZE);
         assert(name);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         uint8_t buf[sizeof(command)];
         size_t offset = 0;
@@ -3586,6 +3770,10 @@ int tpm2_policy_signed_hmac_sha256(
          * specified in the hmac_key parameter. The secret key must be loaded into the TPM already and
          * referenced in hmac_key_handle. */
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         log_debug("Submitting PolicySigned policy for HMAC-SHA256.");
 
         /* Acquire the nonce from the TPM that we shall sign */
@@ -3621,7 +3809,7 @@ int tpm2_policy_signed_hmac_sha256(
         unsigned hmac_signature_size = sizeof(hmac_signature);
 
         /* And sign this with our key */
-        if (!HMAC(EVP_sha256(),
+        if (!sym_HMAC(sym_EVP_sha256(),
                   hmac_key->iov_base,
                   hmac_key->iov_len,
                   digest_to_sign.buffer,
@@ -3675,9 +3863,9 @@ int tpm2_calculate_policy_authorize_nv(
         assert(digest);
         assert(digest->size == SHA256_DIGEST_SIZE);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         uint8_t buf[sizeof(command)];
         size_t offset = 0;
@@ -3810,9 +3998,9 @@ int tpm2_calculate_policy_or(const TPM2B_DIGEST *branches, size_t n_branches, TP
         if (n_branches > 8)
                 return -E2BIG;
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         uint8_t buf[sizeof(command)];
         size_t offset = 0;
@@ -3865,9 +4053,9 @@ int tpm2_calculate_policy_pcr(
         assert(digest);
         assert(digest->size == SHA256_DIGEST_SIZE);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         TPML_PCR_SELECTION pcr_selection;
         _cleanup_free_ TPM2B_DIGEST *values = NULL;
@@ -3957,9 +4145,9 @@ int tpm2_calculate_policy_authorize(
         assert(digest);
         assert(digest->size == SHA256_DIGEST_SIZE);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         uint8_t buf[sizeof(command)];
         size_t offset = 0;
@@ -4353,10 +4541,14 @@ int tpm2_tpm2b_public_to_openssl_pkey(const TPM2B_PUBLIC *public, EVP_PKEY **ret
  * "name", because it would break unsealing of previously-sealed objects that used (for example)
  * tpm2_calculate_policy_authorize(). See bug #30546. */
 int tpm2_tpm2b_public_from_openssl_pkey(const EVP_PKEY *pkey, TPM2B_PUBLIC *ret) {
-        int key_id, r;
+        int r;
 
         assert(pkey);
         assert(ret);
+
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
         TPMT_PUBLIC public = {
                 .nameAlg = TPM2_ALG_SHA256,
@@ -4367,12 +4559,7 @@ int tpm2_tpm2b_public_from_openssl_pkey(const EVP_PKEY *pkey, TPM2B_PUBLIC *ret)
                 },
         };
 
-#if OPENSSL_VERSION_MAJOR >= 3
-        key_id = EVP_PKEY_get_id(pkey);
-#else
-        key_id = EVP_PKEY_id(pkey);
-#endif
-
+        int key_id = sym_EVP_PKEY_get_id(pkey);
         switch (key_id) {
         case EVP_PKEY_EC: {
                 public.type = TPM2_ALG_ECC;
@@ -4470,8 +4657,12 @@ int tpm2_tpm2b_public_to_fingerprint(
         if (r < 0)
                 return r;
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         /* Hardcode fingerprint to SHA256 */
-        return pubkey_fingerprint(pkey, EVP_sha256(), ret_fingerprint, ret_fingerprint_size);
+        return pubkey_fingerprint(pkey, sym_EVP_sha256(), ret_fingerprint, ret_fingerprint_size);
 #else
         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL support is disabled.");
 #endif
@@ -4738,7 +4929,7 @@ static int tpm2_kdfa(
         if (!hash_alg_name)
                 return -EOPNOTSUPP;
 
-        _cleanup_free_ void *buf = NULL;
+        _cleanup_(erase_and_freep) void *buf = NULL;
         r = kdf_kb_hmac_derive(
                         "COUNTER",
                         hash_alg_name,
@@ -4816,7 +5007,7 @@ static int tpm2_kdfe(
         /* assert we copied exactly the right amount that we allocated */
         assert(end > info && (uintptr_t) end - (uintptr_t) info == info_len);
 
-        _cleanup_free_ void *buf = NULL;
+        _cleanup_(erase_and_freep) void *buf = NULL;
         r = kdf_ss_derive(
                         hash_alg_name,
                         shared_secret,
@@ -4848,6 +5039,8 @@ static int tpm2_calculate_seal_public(
         int r;
 
         assert(parent);
+        POINTER_MAY_BE_NULL(attributes);
+        POINTER_MAY_BE_NULL(policy);
         assert(seed);
         assert(secret);
         assert(ret);
@@ -4903,7 +5096,7 @@ static int tpm2_calculate_seal_private(
 
         log_debug("Calculating private part of sealed object.");
 
-        _cleanup_free_ void *storage_key = NULL;
+        _cleanup_(erase_and_freep) void *storage_key = NULL;
         size_t storage_key_size;
         r = tpm2_kdfa(parent->publicArea.nameAlg,
                       seed->buffer,
@@ -4923,7 +5116,7 @@ static int tpm2_calculate_seal_private(
 
         size_t bits = (size_t) r * 8;
 
-        _cleanup_free_ void *integrity_key = NULL;
+        _cleanup_(erase_and_freep) void *integrity_key = NULL;
         size_t integrity_key_size;
         r = tpm2_kdfa(parent->publicArea.nameAlg,
                       seed->buffer,
@@ -4938,6 +5131,7 @@ static int tpm2_calculate_seal_private(
                 return log_debug_errno(r, "Could not calculate integrity key KDFa: %m");
 
         TPM2B_AUTH auth = {};
+        CLEANUP_ERASE(auth);
         if (pin) {
                 r = tpm2_auth_value_from_pin(parent->publicArea.nameAlg, pin, &auth);
                 if (r < 0)
@@ -4953,8 +5147,9 @@ static int tpm2_calculate_seal_private(
                         .sensitive.bits = TPM2B_SENSITIVE_DATA_MAKE(secret, secret_size),
                 },
         };
+        CLEANUP_ERASE(sensitive);
 
-        _cleanup_free_ void *marshalled_sensitive = malloc(sizeof(sensitive));
+        _cleanup_(erase_and_freep) void *marshalled_sensitive = malloc(sizeof(sensitive));
         if (!marshalled_sensitive)
                 return log_oom_debug();
 
@@ -5061,7 +5256,7 @@ static int tpm2_calculate_seal_rsa_seed(
 
         size_t seed_size = (size_t) r;
 
-        _cleanup_free_ void *seed = malloc(seed_size);
+        _cleanup_(erase_and_freep) void *seed = malloc(seed_size);
         if (!seed)
                 return log_oom_debug();
 
@@ -5131,7 +5326,7 @@ static int tpm2_calculate_seal_ecc_seed(
         if (r < 0)
                 return r;
 
-        _cleanup_free_ void *shared_secret = NULL;
+        _cleanup_(erase_and_freep) void *shared_secret = NULL;
         size_t shared_secret_size;
         r = ecc_ecdh(pkey, parent_pkey, &shared_secret, &shared_secret_size);
         if (r < 0)
@@ -5172,7 +5367,7 @@ static int tpm2_calculate_seal_ecc_seed(
 
         size_t bits = (size_t) r * 8;
 
-        _cleanup_free_ void *seed = NULL;
+        _cleanup_(erase_and_freep) void *seed = NULL;
         size_t seed_size = 0; /* Explicit initialization to appease gcc */
         r = tpm2_kdfe(parent->publicArea.nameAlg,
                       shared_secret,
@@ -5209,7 +5404,8 @@ static int tpm2_calculate_seal_seed(
 
         log_debug("Calculating encrypted seed for sealed object.");
 
-        _cleanup_free_ void *seed = NULL, *encrypted_seed = NULL;
+        _cleanup_(erase_and_freep) void *seed = NULL;
+        _cleanup_free_ void *encrypted_seed = NULL;
         size_t seed_size = 0, encrypted_seed_size = 0; /* Explicit initialization to appease gcc */
         if (parent->publicArea.type == TPM2_ALG_RSA)
                 r = tpm2_calculate_seal_rsa_seed(parent, &seed, &seed_size, &encrypted_seed, &encrypted_seed_size);
@@ -5445,6 +5641,11 @@ int tpm2_seal(Tpm2Context *c,
                                                seal_key_handle);
 
                 primary_alg = primary_public->publicArea.type;
+
+                /* Propagate fixedTPM/fixedParent flags from sealing key to hmac key */
+                hmac_template.objectAttributes = (hmac_template.objectAttributes & ~(TPMA_OBJECT_FIXEDTPM|TPMA_OBJECT_FIXEDPARENT)) |
+                                                 (primary_public->publicArea.objectAttributes & (TPMA_OBJECT_FIXEDTPM|TPMA_OBJECT_FIXEDPARENT));
+
         } else {
                 if (seal_key_handle != 0)
                         log_debug("Using primary alg sealing, but seal key handle also provided; ignoring seal key handle.");
@@ -5589,6 +5790,7 @@ int tpm2_unseal(Tpm2Context *c,
         int r;
 
         assert(n_blobs > 0);
+        assert(blobs);
         assert(iovec_is_valid(pubkey));
         assert(ret_secret);
 
@@ -5624,8 +5826,9 @@ int tpm2_unseal(Tpm2Context *c,
         if (r < 0)
                 return r;
         if (r == 0) {
+                /* ECC was the only supported algorithm in systemd < 250, use that as implied default, for compatibility */
                 if (primary_alg == 0)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "No SRK or primary algorithm provided.");
+                        primary_alg = TPM2_ALG_ECC;
 
                 TPM2B_PUBLIC template = {
                         .size = sizeof(TPMT_PUBLIC),
@@ -5974,7 +6177,8 @@ int tpm2_undefine_nv_index(
         return 0;
 }
 
-int tpm2_define_nvpcr_nv_index(
+#if HAVE_OPENSSL
+static int tpm2_define_nvpcr_nv_index(
                 Tpm2Context *c,
                 const Tpm2Handle *session,
                 TPM2_HANDLE nv_index,
@@ -6030,6 +6234,9 @@ int tpm2_define_nvpcr_nv_index(
                         /* auth= */ NULL,
                         &public_info,
                         &new_handle->esys_handle);
+        if (rc == TPM2_RC_NV_SPACE)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOSPC),
+                                       "NV index space on TPM exhausted, cannot allocate NvPCR.");
         if (rc == TPM2_RC_NV_DEFINED) {
                 log_debug("NV index 0x%" PRIu32 " already registered.", nv_index);
 
@@ -6090,7 +6297,7 @@ int tpm2_define_nvpcr_nv_index(
         return 1;
 }
 
-int tpm2_extend_nvpcr_nv_index(
+static int tpm2_extend_nvpcr_nv_index(
                 Tpm2Context *c,
                 TPM2_HANDLE nv_index,
                 const Tpm2Handle *nv_handle,
@@ -6131,6 +6338,7 @@ int tpm2_extend_nvpcr_nv_index(
 
         return 0;
 }
+#endif
 
 int tpm2_read_nv_index(
                 Tpm2Context *c,
@@ -6206,6 +6414,7 @@ int tpm2_seal_data(
         assert(c);
         assert(data);
         assert(primary_handle);
+        POINTER_MAY_BE_NULL(policy);
 
         /* This is a generic version of tpm2_seal(), that doesn't imply any policy or any specific
          * combination of the two keypairs in their marshalling. tpm2_seal() is somewhat specific to the FDE
@@ -6271,6 +6480,7 @@ int tpm2_unseal_data(
         assert(public_blob);
         assert(private_blob);
         assert(primary_handle);
+        assert(ret_data);
 
         TPM2B_PUBLIC public;
         r = tpm2_unmarshal_public(public_blob->iov_base, public_blob->iov_len, &public);
@@ -6320,9 +6530,9 @@ int tpm2_list_devices(bool legend, bool quiet) {
         _cleanup_closedir_ DIR *d = NULL;
         int r;
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "TPM2 support is not installed.");
+                return r;
 
         t = table_new("path", "device", "driver");
         if (!t)
@@ -6380,11 +6590,7 @@ int tpm2_list_devices(bool legend, bool quiet) {
                 return 0;
         }
 
-        r = table_print(t, stdout);
-        if (r < 0)
-                return log_error_errno(r, "Failed to show device table: %m");
-
-        return 0;
+        return table_print_or_warn(t);
 #else
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                "TPM2 not supported on this build.");
@@ -6396,9 +6602,9 @@ int tpm2_find_device_auto(char **ret) {
         _cleanup_closedir_ DIR *d = NULL;
         int r;
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support is not installed.");
+                return r;
 
         d = opendir("/sys/class/tpmrm");
         if (!d) {
@@ -6477,6 +6683,10 @@ static const char* tpm2_userspace_event_type_table[_TPM2_USERSPACE_EVENT_TYPE_MA
         [TPM2_EVENT_KEYSLOT]         = "keyslot",
         [TPM2_EVENT_NVPCR_INIT]      = "nvpcr-init",
         [TPM2_EVENT_NVPCR_SEPARATOR] = "nvpcr-separator",
+        [TPM2_EVENT_DM_VERITY]       = "dm-verity",
+        [TPM2_EVENT_IMDS_USERDATA]   = "imds-userdata",
+        [TPM2_EVENT_OS_SEPARATOR]    = "os-separator",
+        [TPM2_EVENT_LOGIN]           = "login",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(tpm2_userspace_event_type, Tpm2UserspaceEventType);
@@ -6603,17 +6813,21 @@ static int tpm2_userspace_log(
         if (fd < 0) /* Apparently tpm2_local_log_open() failed earlier, let's not complain again */
                 return 0;
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         for (size_t i = 0; i < values->count; i++) {
                 const EVP_MD *implementation;
                 const char *a;
 
                 assert_se(a = tpm2_hash_alg_to_string(values->digests[i].hashAlg));
-                assert_se(implementation = EVP_get_digestbyname(a));
+                assert_se(implementation = sym_EVP_get_digestbyname(a));
 
                 r = sd_json_variant_append_arraybo(
                                 &array,
                                 SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
-                                SD_JSON_BUILD_PAIR_HEX("digest", &values->digests[i].digest, EVP_MD_size(implementation)));
+                                SD_JSON_BUILD_PAIR_HEX("digest", &values->digests[i].digest, sym_EVP_MD_get_size(implementation)));
                 if (r < 0)
                         return log_debug_errno(r, "Failed to append digest object to JSON array: %m");
         }
@@ -6671,6 +6885,7 @@ int tpm2_pcr_extend_bytes(
         _cleanup_close_ int log_fd = -EBADF;
         TPML_DIGEST_VALUES values = {};
         TSS2_RC rc;
+        int r;
 
         assert(c);
         assert(iovec_is_valid(data));
@@ -6685,19 +6900,23 @@ int tpm2_pcr_extend_bytes(
         if (strv_isempty(banks))
                 return 0;
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         STRV_FOREACH(bank, banks) {
                 const EVP_MD *implementation;
                 int id;
 
-                assert_se(implementation = EVP_get_digestbyname(*bank));
+                assert_se(implementation = sym_EVP_get_digestbyname(*bank));
 
                 if (values.count >= ELEMENTSOF(values.digests))
                         return log_debug_errno(SYNTHETIC_ERRNO(E2BIG), "Too many banks selected.");
 
-                if ((size_t) EVP_MD_size(implementation) > sizeof(values.digests[values.count].digest))
+                if ((size_t) sym_EVP_MD_get_size(implementation) > sizeof(values.digests[values.count].digest))
                         return log_debug_errno(SYNTHETIC_ERRNO(E2BIG), "Hash result too large for TPM2.");
 
-                id = tpm2_hash_alg_from_string(EVP_MD_name(implementation));
+                id = tpm2_hash_alg_from_string(sym_EVP_MD_get0_name(implementation));
                 if (id < 0)
                         return log_debug_errno(id, "Can't map hash name to TPM2.");
 
@@ -6710,9 +6929,9 @@ int tpm2_pcr_extend_bytes(
                  * some unrelated purpose, who knows). Hence we instead measure an HMAC signature of a
                  * private non-secret string instead. */
                 if (iovec_is_set(secret) > 0) {
-                        if (!HMAC(implementation, secret->iov_base, secret->iov_len, data->iov_base, data->iov_len, (unsigned char*) &values.digests[values.count].digest, NULL))
+                        if (!sym_HMAC(implementation, secret->iov_base, secret->iov_len, data->iov_base, data->iov_len, (unsigned char*) &values.digests[values.count].digest, NULL))
                                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to calculate HMAC of data to measure.");
-                } else if (EVP_Digest(data->iov_base, data->iov_len, (unsigned char*) &values.digests[values.count].digest, NULL, implementation, NULL) != 1)
+                } else if (sym_EVP_Digest(data->iov_base, data->iov_len, (unsigned char*) &values.digests[values.count].digest, NULL, implementation, NULL) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to hash data to measure.");
 
                 values.count++;
@@ -6757,6 +6976,7 @@ typedef struct NvPCRData {
         char *name;
         uint16_t algorithm;
         uint32_t nv_index;
+        uint64_t priority;
 } NvPCRData;
 
 static void nvpcr_data_done(NvPCRData *d) {
@@ -6796,11 +7016,13 @@ static int nvpcr_data_load(const char *name, NvPCRData *ret) {
                 { "name",      SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,      offsetof(NvPCRData, name),      SD_JSON_MANDATORY },
                 { "algorithm", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_tpm2_algorithm, offsetof(NvPCRData, algorithm), 0                 },
                 { "nvIndex",   _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint32,      offsetof(NvPCRData, nv_index),  SD_JSON_MANDATORY },
+                { "priority",  _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,      offsetof(NvPCRData, priority),  0                 },
                 {},
         };
 
         _cleanup_(nvpcr_data_done) NvPCRData p = {
                 .algorithm = TPM2_ALG_SHA256,
+                .priority = TPM2_NVPCR_PRIORITY_DEFAULT,
         };
         r = sd_json_dispatch(v, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &p);
         if (r < 0)
@@ -6813,7 +7035,7 @@ static int nvpcr_data_load(const char *name, NvPCRData *ret) {
         return 0;
 }
 
-int tpm2_nvpcr_get_index(const char *name, uint32_t *ret) {
+int tpm2_nvpcr_get_index(const char *name, uint32_t *ret_nv_index, uint64_t *ret_priority) {
         int r;
 
         _cleanup_(nvpcr_data_done) NvPCRData p = {};
@@ -6821,8 +7043,10 @@ int tpm2_nvpcr_get_index(const char *name, uint32_t *ret) {
         if (r < 0)
                 return r;
 
-        if (ret)
-                *ret = p.nv_index;
+        if (ret_nv_index)
+                *ret_nv_index = p.nv_index;
+        if (ret_priority)
+                *ret_priority = p.priority;
 
         return 0;
 }
@@ -6844,6 +7068,10 @@ int tpm2_nvpcr_extend_bytes(
         assert(name);
         assert(iovec_is_valid(data));
         assert(iovec_is_valid(secret));
+
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
         _cleanup_(nvpcr_data_done) NvPCRData p = {};
         r = nvpcr_data_load(name, &p);
@@ -6868,10 +7096,10 @@ int tpm2_nvpcr_extend_bytes(
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Unsupported algorithm for NvPCR, refusing.");
 
         const EVP_MD *implementation;
-        assert_se(implementation = EVP_get_digestbyname(an));
+        assert_se(implementation = sym_EVP_get_digestbyname(an));
 
         _cleanup_(iovec_done) struct iovec digest = {
-                .iov_len = EVP_MD_size(implementation),
+                .iov_len = sym_EVP_MD_get_size(implementation),
         };
 
         digest.iov_base = malloc(digest.iov_len);
@@ -6882,9 +7110,9 @@ int tpm2_nvpcr_extend_bytes(
                 data = &iovec_empty;
 
         if (iovec_is_set(secret)) {
-                if (!HMAC(implementation, secret->iov_base, secret->iov_len, data->iov_base, data->iov_len, digest.iov_base, NULL))
+                if (!sym_HMAC(implementation, secret->iov_base, secret->iov_len, data->iov_base, data->iov_len, digest.iov_base, NULL))
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to calculate HMAC of data to measure.");
-        } else if (EVP_Digest(data->iov_base, data->iov_len, digest.iov_base, NULL, implementation, NULL) != 1)
+        } else if (sym_EVP_Digest(data->iov_base, data->iov_len, digest.iov_base, NULL, implementation, NULL) != 1)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to hash data to measure.");
 
         _cleanup_(tpm2_handle_freep) Tpm2Handle *nv_handle = NULL;
@@ -6947,9 +7175,10 @@ static int tpm2_nvpcr_write_anchor_secret(
 
         /* Writes the encrypted credential of the anchor secret to directory 'dir' and file 'fname' */
 
-        _cleanup_close_ int dfd = open_mkdir(dir, O_CLOEXEC, 0755);
-        if (dfd < 0)
-                return log_error_errno(dfd, "Failed to create '%s' directory: %m", dir);
+        _cleanup_close_ int dfd = -EBADF;
+        r = chase(dir, /* root= */ NULL, CHASE_MKDIR_0755|CHASE_MUST_BE_DIRECTORY, /* ret_path= */ NULL, &dfd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create '%s' directory: %m", dir);
 
         _cleanup_free_ char *joined = path_join(dir, fname);
         if (!joined)
@@ -6968,7 +7197,7 @@ static int tpm2_nvpcr_write_anchor_secret(
         if (r < 0) {
                 if (r != -ENOENT)
                         return log_error_errno(r, "Failed to read '%s' file: %m", joined);
-        } else if (iovec_memcmp(&existing, credential) == 0) {
+        } else if (iovec_equal(&existing, credential)) {
                 log_debug("Anchor secret file '%s' already matches expectations, not updating.", joined);
                 return 0;
         } else
@@ -7015,7 +7244,7 @@ static int tpm2_nvpcr_write_anchor_secret_to_boot(const struct iovec *credential
                         /* root= */ NULL,
                         /* conf_root= */ NULL,
                         machine_id,
-                        /* machine_id_is_random = */ false,
+                        /* machine_id_is_random= */ false,
                         &entry_token_type,
                         &entry_token);
         if (r < 0)
@@ -7300,6 +7529,44 @@ int tpm2_nvpcr_acquire_anchor_secret(struct iovec *ret, bool sync_secondary) {
 #endif
 }
 
+#if HAVE_OPENSSL
+static int tpm2_context_can_nvindex(Tpm2Context *c) {
+        int r;
+
+        assert(c);
+
+        if (!streq_ptr(c->tcti_driver, "device")) {
+                log_debug("Not checking udev database, because not using 'device' TCTI.");
+                return 1;
+        }
+
+        if (!c->tcti_param) {
+                log_debug("No device specified, not checking udev database.");
+                return 1;
+        }
+
+        _cleanup_(sd_device_unrefp) sd_device *d = NULL;
+        r = sd_device_new_from_devname(&d, c->tcti_param);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire udev entry for device '%s': %m", c->tcti_param);
+
+        r = device_get_property_bool(d, "TPM2_BROKEN_NVPCR");
+        if (r == -ENOENT) {
+                log_device_debug_errno(d, r, "No TPM2_BROKEN_NVPCR property for '%s', assuming NvPCRs work.", c->tcti_param);
+                return 1;
+        }
+        if (r < 0)
+                return log_device_debug_errno(d, r, "Failed to query TPM2_BROKEN_NVPCR for '%s': %m", c->tcti_param);
+        if (r > 0) {
+                log_device_debug(d, "TPM2_BROKEN_NVPCR property for '%s' explicitly set, NvPCRs do not work.", c->tcti_param);
+                return 0;
+        }
+
+        log_device_debug(d, "TPM2_BROKEN_NVPCR property for '%s' explicitly set to false, hence NvPCRs work.", c->tcti_param);
+        return 1;
+}
+#endif
+
 int tpm2_nvpcr_initialize(
                 Tpm2Context *c,
                 const Tpm2Handle *session,
@@ -7313,6 +7580,12 @@ int tpm2_nvpcr_initialize(
         assert(c);
         assert(name);
 
+        r = tpm2_context_can_nvindex(c);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "TPM2 device does not support NvPCRs, not initializing.");
+
         _cleanup_(nvpcr_data_done) NvPCRData p = {};
         r = nvpcr_data_load(name, &p);
         if (r < 0)
@@ -7323,7 +7596,7 @@ int tpm2_nvpcr_initialize(
 
         _cleanup_close_ int dfd = open_mkdir("/run/systemd/nvpcr", O_CLOEXEC, 0755);
         if (dfd < 0)
-                return log_error_errno(dfd, "Failed to open directory '/run/systemd/nvpcr': %m");
+                return log_debug_errno(dfd, "Failed to open directory '/run/systemd/nvpcr': %m");
 
         const char *anchor_fname = strjoina(name, ".anchor");
         if (faccessat(dfd, anchor_fname, F_OK, AT_SYMLINK_NOFOLLOW) < 0) {
@@ -7341,10 +7614,14 @@ int tpm2_nvpcr_initialize(
         if (!an)
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Unsupported algorithm for NvPCR, refusing.");
 
-        const EVP_MD *implementation;
-        assert_se(implementation = EVP_get_digestbyname(an));
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
-        int digest_size = EVP_MD_get_size(implementation);
+        const EVP_MD *implementation;
+        assert_se(implementation = sym_EVP_get_digestbyname(an));
+
+        int digest_size = sym_EVP_MD_get_size(implementation);
         assert_se(digest_size > 0);
 
         if ((size_t) digest_size > sizeof_field(TPM2B_MAX_NV_BUFFER, buffer))
@@ -7365,7 +7642,7 @@ int tpm2_nvpcr_initialize(
         CLEANUP_ERASE(buf);
 
         /* We measure HMAC(anchor_secret, name) into the NvPCR to anchor it on our secret. */
-        if (!HMAC(implementation, anchor_secret->iov_base, anchor_secret->iov_len, hmac_buffer, hmac_buffer_size, buf.buffer, NULL))
+        if (!sym_HMAC(implementation, anchor_secret->iov_base, anchor_secret->iov_len, hmac_buffer, hmac_buffer_size, buf.buffer, NULL))
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to calculate HMAC of data to measure.");
 
         _cleanup_(tpm2_handle_freep) Tpm2Handle *nv_handle = NULL;
@@ -7461,7 +7738,8 @@ int tpm2_nvpcr_read(
                 const Tpm2Handle *session,
                 const char *name,
                 struct iovec *ret_value,
-                uint32_t *ret_nv_index) {
+                uint32_t *ret_nv_index,
+                uint64_t *ret_priority) {
 
 #if HAVE_OPENSSL
         int r;
@@ -7477,6 +7755,23 @@ int tpm2_nvpcr_read(
         if (r < 0)
                 return r;
 
+        /* Check if the NvPCR is already anchored */
+        const char *anchor_fname = strjoina("/run/systemd/nvpcr/", name, ".anchor");
+        r = access_nofollow(anchor_fname, F_OK);
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return log_debug_errno(r, "Failed to check if '%s' exists: %m", anchor_fname);
+
+                /* valid, but not anchored */
+                *ret_value = (struct iovec) {};
+                if (ret_nv_index)
+                        *ret_nv_index = p.nv_index;
+                if (ret_priority)
+                        *ret_priority = p.priority;
+
+                return 0;
+        }
+
         _cleanup_(tpm2_handle_freep) Tpm2Handle *nv_handle = NULL;
         r = tpm2_index_to_handle(
                         c,
@@ -7491,19 +7786,28 @@ int tpm2_nvpcr_read(
 
         log_debug("Successfully acquired handle to NV index 0x%" PRIx32 ".", p.nv_index);
 
-        r = tpm2_read_nv_index(
-                        c,
-                        /* session= */ NULL,
-                        p.nv_index,
-                        nv_handle,
-                        ret_value);
-        if (r < 0)
-                return r;
+        if (r > 0) {
+                r = tpm2_read_nv_index(
+                                c,
+                                /* session= */ NULL,
+                                p.nv_index,
+                                nv_handle,
+                                ret_value);
+                if (r < 0)
+                        return r;
+
+                r = 1;
+        } else {
+                *ret_value = (struct iovec) {};
+                r = 0;
+        }
 
         if (ret_nv_index)
                 *ret_nv_index = p.nv_index;
+        if (ret_priority)
+                *ret_priority = p.priority;
 
-        return 0;
+        return r;
 #else /* HAVE_OPENSSL */
         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL support is disabled.");
 #endif
@@ -8048,6 +8352,8 @@ int tpm2_pcrlock_policy_load(
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
+        assert(ret_policy);
+
         r = tpm2_pcrlock_search_file(path, &f, &discovered_path);
         if (r == -ENOENT) {
                 *ret_policy = (Tpm2PCRLockPolicy) {};
@@ -8060,7 +8366,7 @@ int tpm2_pcrlock_policy_load(
         r = sd_json_parse_file(
                         f,
                         discovered_path,
-                        /* flags = */ 0,
+                        /* flags= */ 0,
                         &v,
                         /* reterr_line= */ NULL,
                         /* ret_column= */ NULL);
@@ -8184,8 +8490,8 @@ int tpm2_pcrlock_policy_from_credentials(
                         continue;
                 }
 
-                if ((!srk || iovec_memcmp(srk, &loaded_policy.srk_handle) == 0) &&
-                    (!nv || iovec_memcmp(nv, &loaded_policy.nv_handle) == 0)) {
+                if ((!srk || iovec_equal(srk, &loaded_policy.srk_handle)) &&
+                    (!nv || iovec_equal(nv, &loaded_policy.nv_handle))) {
                         *ret = TAKE_STRUCT(loaded_policy);
                         return 1;
                 }
@@ -8206,9 +8512,9 @@ int tpm2_load_public_key_file(const char *path, TPM2B_PUBLIC *ret) {
         assert(path);
         assert(ret);
 
-        r = dlopen_tpm2();
+        r = dlopen_tpm2(LOG_DEBUG);
         if (r < 0)
-                return log_debug_errno(r, "TPM2 support not installed: %m");
+                return r;
 
         r = read_full_file(path, &device_key_buffer, &device_key_buffer_size);
         if (r < 0)
@@ -8564,7 +8870,7 @@ int tpm2_parse_luks2_json(
 
         _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
         uint32_t hash_pcr_mask = 0, pubkey_pcr_mask = 0;
-        uint16_t primary_alg = TPM2_ALG_ECC; /* ECC was the only supported algorithm in systemd < 250, use that as implied default, for compatibility */
+        uint16_t primary_alg = 0;
         uint16_t pcr_bank = UINT16_MAX; /* default: pick automatically */
         int r, keyslot = -1;
         TPM2Flags flags = 0;
@@ -8869,15 +9175,15 @@ Tpm2Support tpm2_support_full(Tpm2Support mask) {
         support |= TPM2_SUPPORT_SYSTEM;
 
         if ((mask & (TPM2_SUPPORT_LIBRARIES|TPM2_SUPPORT_LIBTSS2_ALL)) != 0) {
-                r = dlopen_tpm2_esys();
+                r = dlopen_tpm2_esys(LOG_DEBUG);
                 if (r >= 0)
                         support |= TPM2_SUPPORT_LIBTSS2_ESYS;
 
-                r = dlopen_tpm2_rc();
+                r = dlopen_tpm2_rc(LOG_DEBUG);
                 if (r >= 0)
                         support |= TPM2_SUPPORT_LIBTSS2_RC;
 
-                r = dlopen_tpm2_mu();
+                r = dlopen_tpm2_mu(LOG_DEBUG);
                 if (r >= 0)
                         support |= TPM2_SUPPORT_LIBTSS2_MU;
 
@@ -9213,7 +9519,6 @@ DEFINE_STRING_TABLE_LOOKUP_FROM_STRING_WITH_FALLBACK(tpm2_pcr_index, int, TPM2_P
 DEFINE_STRING_TABLE_LOOKUP_TO_STRING(tpm2_pcr_index, int);
 
 bool tpm2_nvpcr_name_is_valid(const char *name) {
-        return filename_is_valid(name) &&
-                string_is_safe(name) &&
+        return string_is_safe(name, STRING_FILENAME) &&
                 tpm2_pcr_index_from_string(name) < 0; /* don't allow nvpcrs to be name like pcrs */
 }

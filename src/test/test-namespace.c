@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/nsfs.h>
 #include <sched.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -43,7 +45,8 @@ static void test_tmpdir_one(const char *id, const char *A, const char *B) {
         struct stat x, y;
         char *c, *d;
 
-        ASSERT_OK_ZERO(setup_tmp_dirs(id, &a, &b));
+        ASSERT_OK(setup_tmp_dir_one(id, "/tmp", &a));
+        ASSERT_OK(setup_tmp_dir_one(id, "/var/tmp", &b));
 
         ASSERT_OK_ERRNO(stat(a, &x));
         ASSERT_OK_ERRNO(stat(b, &y));
@@ -94,7 +97,7 @@ TEST(tmpdir) {
 static void test_shareable_ns(unsigned long nsflag) {
         _cleanup_close_pair_ int s[2] = EBADF_PAIR;
         bool permission_denied = false;
-        pid_t pid1, pid2, pid3;
+        _cleanup_(pidref_done) PidRef pidref1 = PIDREF_NULL, pidref2 = PIDREF_NULL, pidref3 = PIDREF_NULL;
         int r, n = 0;
         siginfo_t si;
 
@@ -105,51 +108,48 @@ static void test_shareable_ns(unsigned long nsflag) {
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, s));
 
-        pid1 = fork();
-        ASSERT_OK_ERRNO(pid1);
+        r = ASSERT_OK(pidref_safe_fork("(share-ns-1)", FORK_LOG|FORK_DEATHSIG_SIGKILL, &pidref1));
 
-        if (pid1 == 0) {
+        if (r == 0) {
                 r = setup_shareable_ns(s, nsflag);
                 if (!ERRNO_IS_PRIVILEGE(r))
                         ASSERT_OK(r);
                 _exit(r >= 0 ? r : EX_NOPERM);
         }
 
-        pid2 = fork();
-        ASSERT_OK_ERRNO(pid2);
+        r = ASSERT_OK(pidref_safe_fork("(share-ns-2)", FORK_LOG|FORK_DEATHSIG_SIGKILL, &pidref2));
 
-        if (pid2 == 0) {
+        if (r == 0) {
                 r = setup_shareable_ns(s, nsflag);
                 if (!ERRNO_IS_PRIVILEGE(r))
                         ASSERT_OK(r);
                 _exit(r >= 0 ? r : EX_NOPERM);
         }
 
-        pid3 = fork();
-        ASSERT_OK_ERRNO(pid3);
+        r = ASSERT_OK(pidref_safe_fork("(share-ns-3)", FORK_LOG|FORK_DEATHSIG_SIGKILL, &pidref3));
 
-        if (pid3 == 0) {
+        if (r == 0) {
                 r = setup_shareable_ns(s, nsflag);
                 if (!ERRNO_IS_PRIVILEGE(r))
                         ASSERT_OK(r);
                 _exit(r >= 0 ? r : EX_NOPERM);
         }
 
-        ASSERT_OK(wait_for_terminate(pid1, &si));
+        ASSERT_OK(pidref_wait_for_terminate(&pidref1, &si));
         ASSERT_EQ(si.si_code, CLD_EXITED);
         if (si.si_status == EX_NOPERM)
                 permission_denied = true;
         else
                 n += si.si_status;
 
-        ASSERT_OK(wait_for_terminate(pid2, &si));
+        ASSERT_OK(pidref_wait_for_terminate(&pidref2, &si));
         ASSERT_EQ(si.si_code, CLD_EXITED);
         if (si.si_status == EX_NOPERM)
                 permission_denied = true;
         else
                 n += si.si_status;
 
-        ASSERT_OK(wait_for_terminate(pid3, &si));
+        ASSERT_OK(pidref_wait_for_terminate(&pidref3, &si));
         ASSERT_EQ(si.si_code, CLD_EXITED);
         if (si.si_status == EX_NOPERM)
                 permission_denied = true;
@@ -201,9 +201,7 @@ TEST(protect_kernel_logs) {
         static const NamespaceParameters p = {
                 .runtime_scope = RUNTIME_SCOPE_SYSTEM,
                 .protect_kernel_logs = true,
-                .root_directory_fd = -EBADF,
         };
-        pid_t pid;
         int r;
 
         if (geteuid() > 0) {
@@ -217,17 +215,16 @@ TEST(protect_kernel_logs) {
                 return;
         }
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
                 (void) log_tests_skipped("libmount support not compiled in");
                 return;
         }
         ASSERT_OK(r);
 
-        pid = fork();
-        ASSERT_OK_ERRNO(pid);
+        r = ASSERT_OK(pidref_safe_fork("(protect)", FORK_WAIT|FORK_LOG|FORK_DEATHSIG_SIGKILL, /* ret= */ NULL));
 
-        if (pid == 0) {
+        if (r == 0) {
                 _cleanup_close_ int fd = -EBADF;
 
                 ASSERT_OK_ERRNO(fd = open("/dev/kmsg", O_RDONLY | O_CLOEXEC));
@@ -239,8 +236,6 @@ TEST(protect_kernel_logs) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        ASSERT_OK_EQ(wait_for_terminate_and_check("ns-kernellogs", pid, WAIT_LOG), EXIT_SUCCESS);
 }
 
 TEST(idmapping_supported) {
@@ -289,6 +284,57 @@ TEST(userns_get_base_uid) {
         ASSERT_ERROR(userns_get_base_uid(fd, &base_uid, &base_gid), ENOMSG);
 }
 
+TEST(namespace_open_by_id) {
+        /* Try our own user namespace first to see if the kernel exposes ns_id at all. */
+        _cleanup_close_ int userns_fd = ASSERT_OK_ERRNO(open("/proc/self/ns/user", O_RDONLY|O_CLOEXEC));
+
+        uint64_t ns_id;
+        int r = RET_NERRNO(ioctl(userns_fd, NS_GET_ID, &ns_id));
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return (void) log_tests_skipped("NS_GET_ID is not supported by this kernel");
+        ASSERT_OK(r);
+
+        /* namespace_open_by_id() refuses with -EPERM outside the initial user/pid namespace, since
+         * the kernel restricts open_by_handle_at() on nsfs to the initial userns and pidns and to
+         * CAP_SYS_ADMIN. */
+        _cleanup_close_ int opened = namespace_open_by_id(ns_id);
+        if (IN_SET(opened, -EPERM, -ESTALE))
+                return (void) log_tests_skipped("not in initial user namespace or missing CAP_SYS_ADMIN");
+        if (IN_SET(opened, -EOPNOTSUPP, -EINVAL))
+                return (void) log_tests_skipped("nsfs lookup by ns_id is not supported by this kernel");
+        ASSERT_OK(opened);
+
+        struct stat orig_st, opened_st;
+        ASSERT_OK_ERRNO(fstat(userns_fd, &orig_st));
+        ASSERT_OK_ERRNO(fstat(opened, &opened_st));
+        ASSERT_EQ(orig_st.st_ino, opened_st.st_ino);
+
+        opened = safe_close(opened);
+
+        ASSERT_ERROR(namespace_open_by_id(0), EINVAL);
+
+        _cleanup_close_ int transient_fd = userns_acquire_empty();
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(transient_fd) || ERRNO_IS_NEG_PRIVILEGE(transient_fd))
+                return (void) log_tests_skipped("cannot acquire userns for transient lookup test");
+        ASSERT_OK(transient_fd);
+
+        uint64_t transient_id;
+        ASSERT_OK_ERRNO(ioctl(transient_fd, NS_GET_ID, &transient_id));
+        ASSERT_NE(transient_id, ns_id);
+
+        opened = ASSERT_OK(namespace_open_by_id(transient_id));
+
+        struct stat transient_st, transient_opened_st;
+        ASSERT_OK_ERRNO(fstat(transient_fd, &transient_st));
+        ASSERT_OK_ERRNO(fstat(opened, &transient_opened_st));
+        ASSERT_EQ(transient_st.st_ino, transient_opened_st.st_ino);
+        opened = safe_close(opened);
+
+        /* Close the only reference. The namespace is now dead — lookup must fail. */
+        transient_fd = safe_close(transient_fd);
+        ASSERT_ERROR(namespace_open_by_id(transient_id), ESTALE);
+}
+
 TEST(process_is_owned_by_uid) {
         int r;
 
@@ -333,7 +379,7 @@ TEST(process_is_owned_by_uid) {
         ASSERT_OK_ZERO(process_is_owned_by_uid(&pid, getuid()));
 
         ASSERT_OK(pidref_kill(&pid, SIGKILL));
-        ASSERT_OK(pidref_wait_for_terminate(&pid, /* ret= */ NULL));
+        ASSERT_OK(pidref_wait_for_terminate(&pid, NULL));
 
         /* Test a child that runs in a userns as uid 1, but the userns is owned by us */
         ASSERT_OK_ERRNO(pipe2(p, O_CLOEXEC));
@@ -380,7 +426,7 @@ TEST(process_is_owned_by_uid) {
         ASSERT_OK_POSITIVE(process_is_owned_by_uid(&pid, getuid()));
 
         ASSERT_OK(pidref_kill(&pid, SIGKILL));
-        ASSERT_OK(pidref_wait_for_terminate(&pid, /* ret= */ NULL));
+        ASSERT_OK(pidref_wait_for_terminate(&pid, NULL));
 }
 
 TEST(namespace_get_leader) {

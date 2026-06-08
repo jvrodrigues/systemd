@@ -101,7 +101,7 @@ int block_device_get_whole_disk(sd_device *dev, sd_device **ret) {
         return 0;
 }
 
-int block_device_get_originating(sd_device *dev, sd_device **ret) {
+static int block_device_get_originating_one(sd_device *dev, sd_device **ret) {
         _cleanup_(sd_device_unrefp) sd_device *first_found = NULL;
         const char *suffix;
         dev_t devnum = 0;  /* avoid false maybe-uninitialized warning */
@@ -148,6 +148,39 @@ int block_device_get_originating(sd_device *dev, sd_device **ret) {
         return 0;
 }
 
+int block_device_get_originating(sd_device *dev, sd_device **ret, bool recursive) {
+        _cleanup_(sd_device_unrefp) sd_device *current = NULL;
+        int r;
+
+        assert(dev);
+        assert(ret);
+
+        if (!recursive)
+                return block_device_get_originating_one(dev, ret);
+
+        current = sd_device_ref(dev);
+
+        for (;;) {
+                sd_device *origin;
+
+                r = block_device_get_originating_one(current, &origin);
+                if (r == -ENOENT)
+                        break;
+                if (r < 0)
+                        return r;
+
+                sd_device_unref(current);
+                current = origin;
+        }
+
+        if (current == dev)
+                return -ENOENT;
+
+        *ret = TAKE_PTR(current);
+
+        return 0;
+}
+
 int block_device_new_from_fd(int fd, BlockDeviceLookupFlags flags, sd_device **ret) {
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         dev_t devnum;
@@ -172,9 +205,9 @@ int block_device_new_from_fd(int fd, BlockDeviceLookupFlags flags, sd_device **r
                 if (r < 0)
                         return r;
 
-                r = block_device_get_originating(dev_whole_disk, &dev_origin);
+                r = block_device_get_originating(dev_whole_disk, &dev_origin, /* recursive= */ false);
                 if (r >= 0)
-                        device_unref_and_replace(dev, dev_origin);
+                        device_unref_and_replace_new_ref(dev, dev_origin);
                 else if (r != -ENOENT)
                         return r;
         }
@@ -290,7 +323,7 @@ int get_block_device(const char *path, dev_t *ret) {
         return get_block_device_fd(fd, ret);
 }
 
-int block_get_originating(dev_t dt, dev_t *ret) {
+int block_get_originating(dev_t dt, dev_t *ret, bool recursive) {
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL, *origin = NULL;
         int r;
 
@@ -300,7 +333,7 @@ int block_get_originating(dev_t dt, dev_t *ret) {
         if (r < 0)
                 return r;
 
-        r = block_device_get_originating(dev, &origin);
+        r = block_device_get_originating(dev, &origin, recursive);
         if (r < 0)
                 return r;
 
@@ -313,14 +346,14 @@ int get_block_device_harder_fd(int fd, dev_t *ret) {
         assert(fd >= 0);
         assert(ret);
 
-        /* Gets the backing block device for a file system, and handles LUKS encrypted file systems, looking for its
-         * immediate parent, if there is one. */
+        /* Gets the backing block device for a file system, and handles LUKS encrypted file systems, looking
+         * for its underlying physical device, if there is one. */
 
         r = get_block_device_fd(fd, ret);
         if (r <= 0)
                 return r;
 
-        r = block_get_originating(*ret, ret);
+        r = block_get_originating(*ret, ret, /* recursive= */ true);
         if (r < 0)
                 log_debug_errno(r, "Failed to chase block device, ignoring: %m");
 
@@ -609,15 +642,9 @@ int path_get_whole_disk(const char *path, bool backing, dev_t *ret) {
         return fd_get_whole_disk(fd, backing, ret);
 }
 
-int block_device_add_partition(
-                int fd,
-                const char *name,
-                int nr,
-                uint64_t start,
-                uint64_t size) {
+int block_device_add_partition(int fd, int nr, uint64_t start, uint64_t size) {
 
         assert(fd >= 0);
-        assert(name);
         assert(nr > 0);
 
         struct blkpg_partition bp = {
@@ -632,21 +659,12 @@ int block_device_add_partition(
                 .datalen = sizeof(bp),
         };
 
-        if (strlen(name) >= sizeof(bp.devname))
-                return -EINVAL;
-
-        strcpy(bp.devname, name);
-
         return RET_NERRNO(ioctl(fd, BLKPG, &ba));
 }
 
-int block_device_remove_partition(
-                int fd,
-                const char *name,
-                int nr) {
+int block_device_remove_partition(int fd, int nr) {
 
         assert(fd >= 0);
-        assert(name);
         assert(nr > 0);
 
         struct blkpg_partition bp = {
@@ -658,11 +676,6 @@ int block_device_remove_partition(
                 .data = &bp,
                 .datalen = sizeof(bp),
         };
-
-        if (strlen(name) >= sizeof(bp.devname))
-                return -EINVAL;
-
-        strcpy(bp.devname, name);
 
         return RET_NERRNO(ioctl(fd, BLKPG, &ba));
 }
@@ -728,7 +741,7 @@ int partition_enumerator_new(sd_device *dev, sd_device_enumerator **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_device_enumerator_add_match_subsystem(e, "block", /* match = */ true);
+        r = sd_device_enumerator_add_match_subsystem(e, "block", /* match= */ true);
         if (r < 0)
                 return r;
 
@@ -791,7 +804,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to forget btrfs device %s, ignoring: %m", devname);
 
-                r = block_device_remove_partition(fd, devname, nr);
+                r = block_device_remove_partition(fd, nr);
                 if (r == -ENODEV) {
                         log_debug("Kernel removed partition %s before us, ignoring", devname);
                         continue;
@@ -889,6 +902,7 @@ int blockdev_get_root(int level, dev_t *ret) {
 }
 
 int partition_node_of(const char *node, unsigned nr, char **ret) {
+        _cleanup_free_ char *fn = NULL, *dn = NULL;
         int r;
 
         assert(node);
@@ -898,17 +912,11 @@ int partition_node_of(const char *node, unsigned nr, char **ret) {
         /* Given a device node path to a block device returns the device node path to the partition block
          * device of the specified partition */
 
-        _cleanup_free_ char *fn = NULL;
-        r = path_extract_filename(node, &fn);
+        r = path_split_prefix_filename(node, &dn, &fn);
         if (r < 0)
                 return r;
         if (r == O_DIRECTORY)
                 return -EISDIR;
-
-        _cleanup_free_ char *dn = NULL;
-        r = path_extract_directory(node, &dn);
-        if (r < 0 && r != -EDESTADDRREQ) /* allow if only filename is specified */
-                return r;
 
         size_t l = strlen(fn);
         assert(l > 0); /* underflow check for the subtraction below */

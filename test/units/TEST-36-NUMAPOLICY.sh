@@ -34,7 +34,7 @@ testUnitNUMAConf="$testUnitFile.d/numa.conf"
 sleepAfterStart=3
 
 # Journal cursor for easier navigation
-journalCursorFile="jounalCursorFile"
+journalCursorFile="journalCursorFile"
 
 startStrace() {
     coproc strace -qq -p 1 -o "$straceLog" -e set_mempolicy -s 1024 ${1:+"$1"}
@@ -341,7 +341,7 @@ else
 
     systemd-run -p NUMAPolicy=local -p NUMAMask=0 -p CPUAffinity=numa --unit "$runUnit" sleep 1000
     systemctlCheckNUMAProperties "$runUnit" "local" ""
-    systemctl cat "$runUnit" | grep -q 'CPUAffinity=numa'
+    systemctl cat "$runUnit" | grep 'CPUAffinity=numa' >/dev/null
     pid1StopUnit "$runUnit"
 fi
 

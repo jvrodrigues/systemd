@@ -9,10 +9,10 @@
 
 #if BPF_FRAMEWORK
 /* libbpf, clang, llvm and bpftool compile time dependencies are satisfied */
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #include "bpf-link.h"
-#include "bpf/socket-bind/socket-bind-api.bpf.h"
-#include "bpf/socket-bind/socket-bind-skel.h"
+#include "socket-bind-api.bpf.h"
+#include "socket-bind-skel.h"
 
 static struct socket_bind_bpf *socket_bind_bpf_free(struct socket_bind_bpf *obj) {
         /* socket_bind_bpf__destroy handles object == NULL case */
@@ -125,10 +125,10 @@ int bpf_socket_bind_supported(void) {
         _cleanup_(socket_bind_bpf_freep) struct socket_bind_bpf *obj = NULL;
         int r;
 
-        if (dlopen_bpf_full(LOG_WARNING) < 0)
+        if (DLOPEN_BPF(LOG_WARNING, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED) < 0)
                 return false;
 
-        r = prepare_socket_bind_bpf(/*unit=*/NULL, /*allow_rules=*/NULL, /*deny_rules=*/NULL, &obj);
+        r = prepare_socket_bind_bpf(/* unit= */ NULL, /* allow_rules= */ NULL, /* deny_rules= */ NULL, &obj);
         if (r < 0) {
                 log_debug_errno(r, "bpf-socket-bind: socket bind filtering is not supported: %m");
                 return false;
@@ -179,7 +179,7 @@ static int socket_bind_install_impl(Unit *u) {
         if (!crt)
                 return 0;
 
-        r = cg_get_path(crt->cgroup_path, /* suffix = */ NULL, &cgroup_path);
+        r = cg_get_path(crt->cgroup_path, /* suffix= */ NULL, &cgroup_path);
         if (r < 0)
                 return log_unit_error_errno(u, r, "bpf-socket-bind: Failed to get cgroup path: %m");
 

@@ -16,6 +16,7 @@
 #include "fs-util.h"
 #include "hashmap.h"
 #include "id128-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "logind.h"
 #include "logind-device.h"
@@ -25,7 +26,7 @@
 #include "logind-session-dbus.h"
 #include "logind-session-device.h"
 #include "logind-user.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "path-util.h"
 #include "set.h"
 #include "stat-util.h"
@@ -35,6 +36,7 @@
 #include "tmpfile-util.h"
 #include "udev-util.h"
 #include "user-record.h"
+#include "user-util.h"
 
 int seat_new(Manager *m, const char *id, Seat **ret) {
         _cleanup_(seat_freep) Seat *s = NULL;
@@ -330,14 +332,15 @@ static int seat_trigger_devices(Seat *s) {
 static int static_node_acl(Seat *s) {
 #if HAVE_ACL
         int r, ret = 0;
-        uid_t uid;
+        _cleanup_set_free_ Set *uids = NULL;
 
         assert(s);
 
-        if (s->active)
-                uid = s->active->user->user_record->uid;
-        else
-                uid = 0;
+        if (s->active) {
+                r = set_ensure_put(&uids, NULL, UID_TO_PTR(s->active->user->user_record->uid));
+                if (r < 0)
+                        return log_oom();
+        }
 
         _cleanup_closedir_ DIR *dir = opendir("/run/udev/static_node-tags/uaccess/");
         if (!dir) {
@@ -377,7 +380,7 @@ static int static_node_acl(Seat *s) {
                 if (!ERRNO_IS_NEG_DEVICE_ABSENT_OR_EMPTY(r))
                         log_debug_errno(r, "Failed to check if '/run/udev/static_node-tags/uaccess/%s' points to a static device node, ignoring: %m", de->d_name);
 
-                r = devnode_acl(fd, uid);
+                r = devnode_acl(fd, uids);
                 if (r >= 0 || r == -ENOENT)
                         continue;
 
@@ -385,11 +388,11 @@ static int static_node_acl(Seat *s) {
                 _cleanup_free_ char *node = NULL;
                 (void) fd_get_path(fd, &node);
 
-                if (uid != 0) {
+                if (!set_isempty(uids)) {
                         RET_GATHER(ret, log_debug_errno(r, "Failed to apply ACL on '%s': %m", node ?: de->d_name));
 
                         /* Better be safe than sorry and reset ACL */
-                        r = devnode_acl(fd, /* uid = */ 0);
+                        r = devnode_acl(fd, /* uids= */ NULL);
                         if (r >= 0 || r == -ENOENT)
                                 continue;
                 }
@@ -771,7 +774,7 @@ bool seat_can_graphical(Seat *s) {
         return seat_has_master_device(s);
 }
 
-int seat_get_idle_hint(Seat *s, dual_timestamp *t) {
+bool seat_get_idle_hint(Seat *s, dual_timestamp *ret_timestamp) {
         bool idle_hint = true;
         dual_timestamp ts = DUAL_TIMESTAMP_NULL;
 
@@ -779,12 +782,9 @@ int seat_get_idle_hint(Seat *s, dual_timestamp *t) {
 
         LIST_FOREACH(sessions_by_seat, session, s->sessions) {
                 dual_timestamp k;
-                int ih;
+                bool ih;
 
                 ih = session_get_idle_hint(session, &k);
-                if (ih < 0)
-                        return ih;
-
                 if (!ih) {
                         if (!idle_hint) {
                                 if (k.monotonic > ts.monotonic)
@@ -794,14 +794,13 @@ int seat_get_idle_hint(Seat *s, dual_timestamp *t) {
                                 ts = k;
                         }
                 } else if (idle_hint) {
-
                         if (k.monotonic > ts.monotonic)
                                 ts = k;
                 }
         }
 
-        if (t)
-                *t = ts;
+        if (ret_timestamp)
+                *ret_timestamp = ts;
 
         return idle_hint;
 }
@@ -826,6 +825,61 @@ void seat_add_to_gc_queue(Seat *s) {
 
         LIST_PREPEND(gc_queue, s->manager->seat_gc_queue, s);
         s->in_gc_queue = true;
+}
+
+static int seat_sessions_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Seat *s = ASSERT_PTR(userdata);
+        int r;
+
+        assert(ret);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        LIST_FOREACH(sessions_by_seat, session, s->sessions) {
+                r = sd_json_variant_append_arrayb(&v, SD_JSON_BUILD_STRING(session->id));
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(v);
+        return 0;
+}
+
+static int seat_context_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Seat *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Id", s->id));
+}
+
+static int seat_runtime_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Seat *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        dual_timestamp idle_ts;
+        bool idle = seat_get_idle_hint(s, &idle_ts);
+
+        return sd_json_buildo(
+                        ret,
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("ActiveSession", s->active ? s->active->id : NULL),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("Sessions", seat_sessions_build_json, s),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanTTY", seat_can_tty(s)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanGraphical", seat_can_graphical(s)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("IdleHint", idle),
+                        SD_JSON_BUILD_PAIR_CONDITION(idle, "IdleSinceHint", JSON_BUILD_DUAL_TIMESTAMP(&idle_ts)));
+}
+
+int seat_build_json(Seat *s, sd_json_variant **ret) {
+        assert(s);
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", seat_context_build_json, s),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", seat_runtime_build_json, s));
 }
 
 static bool seat_name_valid_char(char c) {

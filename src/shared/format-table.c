@@ -14,6 +14,7 @@
 #include "glyph-util.h"
 #include "gunicode.h"
 #include "in-addr-util.h"
+#include "json-util.h"
 #include "memory-util.h"
 #include "memstream-util.h"
 #include "pager.h"
@@ -86,6 +87,7 @@ typedef struct TableData {
         union {
                 uint8_t data[0];    /* data is generic array */
                 bool boolean;
+                int tristate;
                 usec_t timestamp;
                 usec_t timespan;
                 uint64_t size;
@@ -110,6 +112,7 @@ typedef struct TableData {
                 pid_t pid;
                 mode_t mode;
                 dev_t devnum;
+                sd_json_variant *json;
                 /* … add more here as we start supporting more cell data types … */
         };
 } TableData;
@@ -157,7 +160,7 @@ struct Table {
         bool *reverse_map;
 };
 
-Table *table_new_raw(size_t n_columns) {
+Table* table_new_raw(size_t n_columns) {
         _cleanup_(table_unrefp) Table *t = NULL;
 
         assert(n_columns > 0);
@@ -177,7 +180,7 @@ Table *table_new_raw(size_t n_columns) {
         return TAKE_PTR(t);
 }
 
-Table *table_new_internal(const char *first_header, ...) {
+Table* table_new_internal(const char *first_header, ...) {
         _cleanup_(table_unrefp) Table *t = NULL;
         size_t n_columns = 1;
         va_list ap;
@@ -214,7 +217,7 @@ Table *table_new_internal(const char *first_header, ...) {
         return TAKE_PTR(t);
 }
 
-Table *table_new_vertical(void) {
+Table* table_new_vertical(void) {
         _cleanup_(table_unrefp) Table *t = NULL;
         TableCell *cell;
 
@@ -240,7 +243,7 @@ Table *table_new_vertical(void) {
         return TAKE_PTR(t);
 }
 
-static TableData *table_data_free(TableData *d) {
+static TableData* table_data_free(TableData *d) {
         assert(d);
 
         free(d->formatted);
@@ -249,13 +252,16 @@ static TableData *table_data_free(TableData *d) {
         if (IN_SET(d->type, TABLE_STRV, TABLE_STRV_WRAPPED))
                 strv_free(d->strv);
 
+        if (d->type == TABLE_JSON)
+                sd_json_variant_unref(d->json);
+
         return mfree(d);
 }
 
 DEFINE_PRIVATE_TRIVIAL_REF_UNREF_FUNC(TableData, table_data, table_data_free);
 DEFINE_TRIVIAL_CLEANUP_FUNC(TableData*, table_data_unref);
 
-Table *table_unref(Table *t) {
+Table* table_unref(Table *t) {
         if (!t)
                 return NULL;
 
@@ -283,6 +289,7 @@ static size_t table_data_size(TableDataType type, const void *data) {
                 return 0;
 
         case TABLE_STRING:
+        case TABLE_STRING_WITH_ANSI:
         case TABLE_PATH:
         case TABLE_PATH_BASENAME:
         case TABLE_FIELD:
@@ -336,6 +343,7 @@ static size_t table_data_size(TableDataType type, const void *data) {
         case TABLE_PERCENT:
         case TABLE_IFINDEX:
         case TABLE_SIGNAL:
+        case TABLE_TRISTATE:
                 return sizeof(int);
 
         case TABLE_IN_ADDR:
@@ -361,6 +369,9 @@ static size_t table_data_size(TableDataType type, const void *data) {
 
         case TABLE_DEVNUM:
                 return sizeof(dev_t);
+
+        case TABLE_JSON:
+                return sizeof(sd_json_variant*);
 
         default:
                 assert_not_reached();
@@ -416,7 +427,7 @@ static bool table_data_matches(
         return memcmp_safe(data, d->data, l) == 0;
 }
 
-static TableData *table_data_new(
+static TableData* table_data_new(
                 TableDataType type,
                 const void *data,
                 size_t minimum_width,
@@ -444,12 +455,22 @@ static TableData *table_data_new(
         d->ellipsize_percent = ellipsize_percent;
         d->uppercase = uppercase;
 
-        if (IN_SET(type, TABLE_STRV, TABLE_STRV_WRAPPED)) {
+        switch (type) {
+
+        case TABLE_STRV:
+        case TABLE_STRV_WRAPPED:
                 d->strv = strv_copy(data);
                 if (!d->strv)
                         return NULL;
-        } else
+                break;
+
+        case TABLE_JSON:
+                d->json = sd_json_variant_ref((sd_json_variant*) data);
+                break;
+
+        default:
                 memcpy_safe(d->data, data, data_size);
+        }
 
         return TAKE_PTR(d);
 }
@@ -529,7 +550,7 @@ int table_add_cell_stringf_full(Table *t, TableCell **ret_cell, TableDataType dt
         int r;
 
         assert(t);
-        assert(IN_SET(dt, TABLE_STRING, TABLE_PATH, TABLE_PATH_BASENAME, TABLE_FIELD, TABLE_HEADER, TABLE_VERSION));
+        assert(IN_SET(dt, TABLE_STRING, TABLE_STRING_WITH_ANSI, TABLE_PATH, TABLE_PATH_BASENAME, TABLE_FIELD, TABLE_HEADER, TABLE_VERSION));
 
         va_start(ap, format);
         r = vasprintf(&buffer, format, ap);
@@ -916,6 +937,7 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                         uint64_t uint64;
                         int percent;
                         int ifindex;
+                        int tristate;
                         bool b;
                         union in_addr_union address;
                         sd_id128_t id128;
@@ -933,6 +955,7 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                         break;
 
                 case TABLE_STRING:
+                case TABLE_STRING_WITH_ANSI:
                 case TABLE_PATH:
                 case TABLE_PATH_BASENAME:
                 case TABLE_FIELD:
@@ -950,6 +973,11 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                 case TABLE_BOOLEAN:
                         buffer.b = va_arg(ap, int);
                         data = &buffer.b;
+                        break;
+
+                case TABLE_TRISTATE:
+                        buffer.tristate = va_arg(ap, int);
+                        data = &buffer.tristate;
                         break;
 
                 case TABLE_TIMESTAMP:
@@ -1053,12 +1081,12 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                         break;
 
                 case TABLE_IN_ADDR:
-                        buffer.address = *va_arg(ap, union in_addr_union *);
+                        buffer.address.in = *va_arg(ap, struct in_addr *);
                         data = &buffer.address.in;
                         break;
 
                 case TABLE_IN6_ADDR:
-                        buffer.address = *va_arg(ap, union in_addr_union *);
+                        buffer.address.in6 = *va_arg(ap, struct in6_addr *);
                         data = &buffer.address.in6;
                         break;
 
@@ -1092,6 +1120,10 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                 case TABLE_DEVNUM:
                         buffer.devnum = va_arg(ap, dev_t);
                         data = &buffer.devnum;
+                        break;
+
+                case TABLE_JSON:
+                        data = va_arg(ap, sd_json_variant*);
                         break;
 
                 case TABLE_SET_MINIMUM_WIDTH: {
@@ -1393,6 +1425,7 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
                 switch (a->type) {
 
                 case TABLE_STRING:
+                case TABLE_STRING_WITH_ANSI:
                 case TABLE_FIELD:
                 case TABLE_HEADER:
                         return strcmp(a->string, b->string);
@@ -1409,9 +1442,22 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
                         return strv_compare(a->strv, b->strv);
 
                 case TABLE_BOOLEAN:
+                case TABLE_BOOLEAN_CHECKMARK:
                         if (!a->boolean && b->boolean)
                                 return -1;
                         if (a->boolean && !b->boolean)
+                                return 1;
+                        return 0;
+
+                case TABLE_TRISTATE:
+                        /* NB: we do not use CMP() here, since we want to collapse all negative and all
+                         * positive into one bucket each. */
+                        if ((a->tristate < 0 && b->tristate >= 0) ||
+                            (a->tristate == 0 && b->tristate > 0))
+                                return -1;
+
+                        if ((b->tristate < 0 && a->tristate >= 0) ||
+                            (b->tristate == 0 && a->tristate > 0))
                                 return 1;
                         return 0;
 
@@ -1503,6 +1549,9 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
 
                         return CMP(minor(a->devnum), minor(b->devnum));
 
+                case TABLE_JSON:
+                        return json_variant_compare(a->json, b->json);
+
                 default:
                         ;
                 }
@@ -1515,6 +1564,10 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
 static int table_data_compare(const size_t *a, const size_t *b, Table *t) {
         int r;
 
+        /* This is called from qsort()s inner loops. Correctly implemented qsort will never pass NULL so we
+           just suppress the check via POINTER_MAY_BE_NULL instead of assert() to avoid the runtime cost. */
+        POINTER_MAY_BE_NULL(a);
+        POINTER_MAY_BE_NULL(b);
         assert(t);
         assert(t->sort_map);
 
@@ -1574,7 +1627,13 @@ static char* format_strv_width(char **strv, size_t column_width) {
         return buf;
 }
 
-static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercasing, size_t column_width, bool *have_soft) {
+static const char* table_data_format(
+                Table *t,
+                TableData *d,
+                bool avoid_uppercasing,
+                size_t column_width,
+                bool *have_soft) {
+
         assert(d);
 
         if (d->formatted &&
@@ -1582,11 +1641,14 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
             (d->type != TABLE_STRV_WRAPPED || d->formatted_for_width == column_width))
                 return d->formatted;
 
+        d->formatted = mfree(d->formatted);
+
         switch (d->type) {
         case TABLE_EMPTY:
                 return table_ersatz_string(t);
 
         case TABLE_STRING:
+        case TABLE_STRING_WITH_ANSI:
         case TABLE_PATH:
         case TABLE_PATH_BASENAME:
         case TABLE_FIELD:
@@ -1614,18 +1676,13 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
 
                         *q = 0;
                         return d->formatted;
-                } else if (d->type == TABLE_FIELD) {
-                        d->formatted = strjoin(s, ":");
-                        if (!d->formatted)
-                                return NULL;
-
-                        return d->formatted;
                 }
 
-                if (bn) {
-                        d->formatted = TAKE_PTR(bn);
-                        return d->formatted;
-                }
+                if (d->type == TABLE_FIELD)
+                        return (d->formatted = strjoin(s, ":"));
+
+                if (bn)
+                        return (d->formatted = TAKE_PTR(bn));
 
                 return d->string;
         }
@@ -1634,26 +1691,20 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                 if (strv_isempty(d->strv))
                         return table_ersatz_string(t);
 
-                d->formatted = strv_join(d->strv, "\n");
-                if (!d->formatted)
-                        return NULL;
-                break;
+                return (d->formatted = strv_join(d->strv, "\n"));
 
-        case TABLE_STRV_WRAPPED: {
+        case TABLE_STRV_WRAPPED:
                 if (strv_isempty(d->strv))
                         return table_ersatz_string(t);
 
-                char *buf = format_strv_width(d->strv, column_width);
-                if (!buf)
+                d->formatted = format_strv_width(d->strv, column_width);
+                if (!d->formatted)
                         return NULL;
 
-                free_and_replace(d->formatted, buf);
                 d->formatted_for_width = column_width;
                 if (have_soft)
                         *have_soft = true;
-
-                break;
-        }
+                return d->formatted;
 
         case TABLE_BOOLEAN:
                 return yes_no(d->boolean);
@@ -1661,18 +1712,24 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
         case TABLE_BOOLEAN_CHECKMARK:
                 return glyph(d->boolean ? GLYPH_CHECK_MARK : GLYPH_CROSS_MARK);
 
+        case TABLE_TRISTATE:
+                if (d->tristate < 0)
+                        return table_ersatz_string(t);
+
+                return yes_no(d->tristate);
+
         case TABLE_TIMESTAMP:
         case TABLE_TIMESTAMP_UTC:
         case TABLE_TIMESTAMP_RELATIVE:
         case TABLE_TIMESTAMP_RELATIVE_MONOTONIC:
         case TABLE_TIMESTAMP_LEFT:
         case TABLE_TIMESTAMP_DATE: {
-                _cleanup_free_ char *p = NULL;
                 char *ret;
 
-                p = new(char,
-                        IN_SET(d->type, TABLE_TIMESTAMP_RELATIVE, TABLE_TIMESTAMP_RELATIVE_MONOTONIC, TABLE_TIMESTAMP_LEFT) ?
-                                FORMAT_TIMESTAMP_RELATIVE_MAX : FORMAT_TIMESTAMP_MAX);
+                _cleanup_free_ char *p = new(
+                                char,
+                                IN_SET(d->type, TABLE_TIMESTAMP_RELATIVE, TABLE_TIMESTAMP_RELATIVE_MONOTONIC, TABLE_TIMESTAMP_LEFT) ?
+                                        FORMAT_TIMESTAMP_RELATIVE_MAX : FORMAT_TIMESTAMP_MAX);
                 if (!p)
                         return NULL;
 
@@ -1687,20 +1744,17 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                 else
                         ret = format_timestamp_relative_full(p, FORMAT_TIMESTAMP_RELATIVE_MAX,
                                                              d->timestamp, CLOCK_REALTIME,
-                                                             /* implicit_left = */ d->type == TABLE_TIMESTAMP_LEFT);
+                                                             /* implicit_left= */ d->type == TABLE_TIMESTAMP_LEFT);
                 if (!ret)
                         return "-";
 
-                d->formatted = TAKE_PTR(p);
-                break;
+                return (d->formatted = TAKE_PTR(p));
         }
 
         case TABLE_TIMESPAN:
         case TABLE_TIMESPAN_MSEC:
         case TABLE_TIMESPAN_DAY: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, FORMAT_TIMESPAN_MAX);
+                _cleanup_free_ char *p = new(char, FORMAT_TIMESPAN_MAX);
                 if (!p)
                         return NULL;
 
@@ -1709,344 +1763,137 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                                      d->type == TABLE_TIMESPAN_MSEC ? USEC_PER_MSEC : USEC_PER_DAY))
                         return "-";
 
-                d->formatted = TAKE_PTR(p);
-                break;
+                return (d->formatted = TAKE_PTR(p));
         }
 
         case TABLE_SIZE: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, FORMAT_BYTES_MAX);
+                _cleanup_free_ char *p = new(char, FORMAT_BYTES_MAX);
                 if (!p)
                         return NULL;
 
                 if (!format_bytes(p, FORMAT_BYTES_MAX, d->size))
                         return table_ersatz_string(t);
 
-                d->formatted = TAKE_PTR(p);
-                break;
+                return (d->formatted = TAKE_PTR(p));
         }
 
         case TABLE_BPS: {
-                _cleanup_free_ char *p = NULL;
-                size_t n;
-
-                p = new(char, FORMAT_BYTES_MAX+2);
+                _cleanup_free_ char *p = new(char, FORMAT_BYTES_MAX+2);
                 if (!p)
                         return NULL;
 
                 if (!format_bytes_full(p, FORMAT_BYTES_MAX, d->size, FORMAT_BYTES_BELOW_POINT))
                         return table_ersatz_string(t);
 
-                n = strlen(p);
+                size_t n = strlen(p);
                 strscpy(p + n, FORMAT_BYTES_MAX + 2 - n, "bps");
 
-                d->formatted = TAKE_PTR(p);
-                break;
+                return (d->formatted = TAKE_PTR(p));
         }
 
-        case TABLE_INT: {
-                _cleanup_free_ char *p = NULL;
+        case TABLE_INT:
+                return (d->formatted = asprintf_safe("%i", d->int_val));
 
-                p = new(char, DECIMAL_STR_WIDTH(d->int_val) + 1);
-                if (!p)
-                        return NULL;
+        case TABLE_INT8:
+                return (d->formatted = asprintf_safe("%" PRIi8, d->int8));
 
-                sprintf(p, "%i", d->int_val);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+        case TABLE_INT16:
+                return (d->formatted = asprintf_safe("%" PRIi16, d->int16));
 
-        case TABLE_INT8: {
-                _cleanup_free_ char *p = NULL;
+        case TABLE_INT32:
+                return (d->formatted = asprintf_safe("%" PRIi32, d->int32));
 
-                p = new(char, DECIMAL_STR_WIDTH(d->int8) + 1);
-                if (!p)
-                        return NULL;
+        case TABLE_INT64:
+                return (d->formatted = asprintf_safe("%" PRIi64, d->int64));
 
-                sprintf(p, "%" PRIi8, d->int8);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+        case TABLE_UINT:
+                return (d->formatted = asprintf_safe("%u", d->uint_val));
 
-        case TABLE_INT16: {
-                _cleanup_free_ char *p = NULL;
+        case TABLE_UINT8:
+                return (d->formatted = asprintf_safe("%" PRIu8, d->uint8));
 
-                p = new(char, DECIMAL_STR_WIDTH(d->int16) + 1);
-                if (!p)
-                        return NULL;
+        case TABLE_UINT16:
+                return (d->formatted = asprintf_safe("%" PRIu16, d->uint16));
 
-                sprintf(p, "%" PRIi16, d->int16);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+        case TABLE_UINT32:
+                return (d->formatted = asprintf_safe("%" PRIu32, d->uint32));
 
-        case TABLE_INT32: {
-                _cleanup_free_ char *p = NULL;
+        case TABLE_UINT32_HEX:
+                return (d->formatted = asprintf_safe("%" PRIx32, d->uint32));
 
-                p = new(char, DECIMAL_STR_WIDTH(d->int32) + 1);
-                if (!p)
-                        return NULL;
+        case TABLE_UINT32_HEX_0x:
+                return (d->formatted = asprintf_safe("0x%" PRIx32, d->uint32));
 
-                sprintf(p, "%" PRIi32, d->int32);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+        case TABLE_UINT64:
+                return (d->formatted = asprintf_safe("%" PRIu64, d->uint64));
 
-        case TABLE_INT64: {
-                _cleanup_free_ char *p = NULL;
+        case TABLE_UINT64_HEX:
+                return (d->formatted = asprintf_safe("%" PRIx64, d->uint64));
 
-                p = new(char, DECIMAL_STR_WIDTH(d->int64) + 1);
-                if (!p)
-                        return NULL;
+        case TABLE_UINT64_HEX_0x:
+                return (d->formatted = asprintf_safe("0x%" PRIx64, d->uint64));
 
-                sprintf(p, "%" PRIi64, d->int64);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+        case TABLE_PERCENT:
+                return (d->formatted = asprintf_safe("%i%%" , d->percent));
 
-        case TABLE_UINT: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, DECIMAL_STR_WIDTH(d->uint_val) + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%u", d->uint_val);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT8: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, DECIMAL_STR_WIDTH(d->uint8) + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%" PRIu8, d->uint8);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT16: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, DECIMAL_STR_WIDTH(d->uint16) + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%" PRIu16, d->uint16);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT32: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, DECIMAL_STR_WIDTH(d->uint32) + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%" PRIu32, d->uint32);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT32_HEX: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, 8 + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%" PRIx32, d->uint32);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT32_HEX_0x: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, 2 + 8 + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "0x%" PRIx32, d->uint32);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT64: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, DECIMAL_STR_WIDTH(d->uint64) + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%" PRIu64, d->uint64);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT64_HEX: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, 16 + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%" PRIx64, d->uint64);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_UINT64_HEX_0x: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, 2 + 16 + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "0x%" PRIx64, d->uint64);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_PERCENT: {
-                _cleanup_free_ char *p = NULL;
-
-                p = new(char, DECIMAL_STR_WIDTH(d->percent) + 2);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%i%%" , d->percent);
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
-
-        case TABLE_IFINDEX: {
-                _cleanup_free_ char *p = NULL;
-
-                if (format_ifname_full_alloc(d->ifindex, FORMAT_IFNAME_IFINDEX, &p) < 0)
-                        return NULL;
-
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+        case TABLE_IFINDEX:
+                (void) format_ifname_full_alloc(d->ifindex, FORMAT_IFNAME_IFINDEX, &d->formatted);
+                return d->formatted;
 
         case TABLE_IN_ADDR:
-        case TABLE_IN6_ADDR: {
-                _cleanup_free_ char *p = NULL;
+        case TABLE_IN6_ADDR:
+                (void) in_addr_to_string(d->type == TABLE_IN_ADDR ? AF_INET : AF_INET6,
+                                         &d->address,
+                                         &d->formatted);
+                return d->formatted;
 
-                if (in_addr_to_string(d->type == TABLE_IN_ADDR ? AF_INET : AF_INET6,
-                                      &d->address, &p) < 0)
+        case TABLE_ID128:
+                d->formatted = new(char, SD_ID128_STRING_MAX);
+                if (!d->formatted)
                         return NULL;
 
-                d->formatted = TAKE_PTR(p);
-                break;
-        }
+                return sd_id128_to_string(d->id128, d->formatted);
 
-        case TABLE_ID128: {
-                char *p;
-
-                p = new(char, SD_ID128_STRING_MAX);
-                if (!p)
+        case TABLE_UUID:
+                d->formatted = new(char, SD_ID128_UUID_STRING_MAX);
+                if (!d->formatted)
                         return NULL;
 
-                d->formatted = sd_id128_to_string(d->id128, p);
-                break;
-        }
+                return sd_id128_to_uuid_string(d->id128, d->formatted);
 
-        case TABLE_UUID: {
-                char *p;
-
-                p = new(char, SD_ID128_UUID_STRING_MAX);
-                if (!p)
-                        return NULL;
-
-                d->formatted = sd_id128_to_uuid_string(d->id128, p);
-                break;
-        }
-
-        case TABLE_UID: {
-                char *p;
-
+        case TABLE_UID:
                 if (!uid_is_valid(d->uid))
                         return table_ersatz_string(t);
 
-                p = new(char, DECIMAL_STR_WIDTH(d->uid) + 1);
-                if (!p)
-                        return NULL;
-                sprintf(p, UID_FMT, d->uid);
+                return (d->formatted = asprintf_safe(UID_FMT, d->uid));
 
-                d->formatted = p;
-                break;
-        }
-
-        case TABLE_GID: {
-                char *p;
-
+        case TABLE_GID:
                 if (!gid_is_valid(d->gid))
                         return table_ersatz_string(t);
 
-                p = new(char, DECIMAL_STR_WIDTH(d->gid) + 1);
-                if (!p)
-                        return NULL;
-                sprintf(p, GID_FMT, d->gid);
+                return (d->formatted = asprintf_safe(GID_FMT, d->gid));
 
-                d->formatted = p;
-                break;
-        }
-
-        case TABLE_PID: {
-                char *p;
-
+        case TABLE_PID:
                 if (!pid_is_valid(d->pid))
                         return table_ersatz_string(t);
 
-                p = new(char, DECIMAL_STR_WIDTH(d->pid) + 1);
-                if (!p)
-                        return NULL;
-                sprintf(p, PID_FMT, d->pid);
-
-                d->formatted = p;
-                break;
-        }
+                return (d->formatted = asprintf_safe(PID_FMT, d->pid));
 
         case TABLE_SIGNAL: {
-                const char *suffix;
-                char *p;
-
-                suffix = signal_to_string(d->int_val);
+                const char *suffix = signal_to_string(d->int_val);
                 if (!suffix)
                         return table_ersatz_string(t);
 
-                p = strjoin("SIG", suffix);
-                if (!p)
-                        return NULL;
-
-                d->formatted = p;
-                break;
+                return (d->formatted = strjoin("SIG", suffix));
         }
 
-        case TABLE_MODE: {
-                char *p;
-
+        case TABLE_MODE:
                 if (d->mode == MODE_INVALID)
                         return table_ersatz_string(t);
 
-                p = new(char, 4 + 1);
-                if (!p)
-                        return NULL;
-
-                sprintf(p, "%04o", d->mode & 07777);
-                d->formatted = p;
-                break;
-        }
+                return (d->formatted = asprintf_safe("%04o", d->mode & 07777));
 
         case TABLE_MODE_INODE_TYPE:
-
                 if (d->mode == MODE_INVALID)
                         return table_ersatz_string(t);
 
@@ -2056,16 +1903,54 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                 if (devnum_is_zero(d->devnum))
                         return table_ersatz_string(t);
 
-                if (asprintf(&d->formatted, DEVNUM_FORMAT_STR, DEVNUM_FORMAT_VAL(d->devnum)) < 0)
-                        return NULL;
+                return (d->formatted = asprintf_safe(DEVNUM_FORMAT_STR, DEVNUM_FORMAT_VAL(d->devnum)));
 
-                break;
+        case TABLE_JSON:
+                if (!d->json)
+                        return table_ersatz_string(t);
+
+                (void) sd_json_variant_format(d->json, /* flags= */ 0, &d->formatted);
+                return d->formatted;
 
         default:
                 assert_not_reached();
         }
+}
 
-        return d->formatted;
+static const char* table_data_format_strip_ansi(
+                Table *t,
+                TableData *d,
+                bool avoid_uppercasing,
+                size_t column_width,
+                bool *have_soft,
+                char **ret_buffer) {
+
+        /* Just like table_data_format() but strips ANSI sequences for ANSI fields. */
+
+        assert(ret_buffer);
+
+        const char *c;
+
+        c = table_data_format(t, d, avoid_uppercasing, column_width, have_soft);
+        if (!c)
+                return NULL;
+
+        if (d->type != TABLE_STRING_WITH_ANSI) {
+                /* Shortcut: we do not consider ANSI sequences for all other column types, hence return the
+                 * original string as-is */
+                *ret_buffer = NULL;
+                return c;
+        }
+
+        _cleanup_free_ char *s = strdup(c);
+        if (!s)
+                return NULL;
+
+        if (!strip_tab_ansi(&s, /* isz= */ NULL, /* highlight= */ NULL))
+                return NULL;
+
+        *ret_buffer = TAKE_PTR(s);
+        return *ret_buffer;
 }
 
 static int console_width_height(
@@ -2122,14 +2007,20 @@ static int table_data_requested_width_height(
                 size_t *ret_height,
                 bool *have_soft) {
 
-        _cleanup_free_ char *truncated = NULL;
+        _cleanup_free_ char *truncated = NULL, *buffer = NULL;
         bool truncation_applied = false;
         size_t width, height;
+        bool soft = false;
         const char *t;
         int r;
-        bool soft = false;
 
-        t = table_data_format(table, d, false, available_width, &soft);
+        t = table_data_format_strip_ansi(
+                        table,
+                        d,
+                        /* avoid_uppercasing= */ false,
+                        available_width,
+                        &soft,
+                        &buffer);
         if (!t)
                 return -ENOMEM;
 
@@ -2163,7 +2054,7 @@ static int table_data_requested_width_height(
         return truncation_applied;
 }
 
-static char *align_string_mem(const char *str, const char *url, size_t new_length, unsigned percent) {
+static char* align_string_mem(const char *str, const char *url, size_t new_length, unsigned percent) {
         size_t w = 0, space, lspace, old_length, clickable_length;
         _cleanup_free_ char *clickable = NULL;
         const char *p;
@@ -2232,6 +2123,9 @@ static bool table_data_isempty(const TableData *d) {
         if (IN_SET(d->type, TABLE_STRV, TABLE_STRV_WRAPPED))
                 return strv_isempty(d->strv);
 
+        if (d->type == TABLE_JSON)
+                return sd_json_variant_is_null(d->json);
+
         /* Note that an empty string we do not consider empty here! */
         return false;
 }
@@ -2276,12 +2170,86 @@ static const char* table_data_rgap_underline(const TableData *d) {
         return NULL;
 }
 
-int table_print(Table *t, FILE *f) {
-        size_t n_rows, *minimum_width, *maximum_width, display_columns, *requested_width,
-                table_minimum_width, table_maximum_width, table_requested_width, table_effective_width,
-                *width = NULL;
+int table_data_requested_width(Table *table, size_t column, size_t *ret) {
+        size_t width = 0;
+        int r;
+
+        assert(table);
+        assert(ret);
+
+        for (size_t row = 0; row < table_get_rows(table); row++) {
+                TableCell *cell = table_get_cell(table, row, column);
+                if (!cell)
+                        continue;
+
+                TableData *data = table_get_data(table, cell);
+                if (!data)
+                        continue;
+
+                size_t w;
+
+                r = table_data_requested_width_height(
+                                table, data, SIZE_MAX, &w, /* ret_height= */ NULL, /* have_soft= */ NULL);
+                if (r < 0)
+                        return r;
+
+                width = MAX(width, w);
+        }
+
+        *ret = width;
+        return 0;
+}
+
+int table_set_column_width(Table *t, size_t column, size_t width) {
+        int r = 0;
+
+        assert(t);
+
+        for (size_t row = 0; row < table_get_rows(t); row++) {
+                TableCell *cell = table_get_cell(t, row, column);
+                if (!cell)
+                        continue;
+
+                RET_GATHER(r, table_set_minimum_width(t, cell, width));
+        }
+
+        return r;
+}
+
+int _table_sync_column_widths(size_t column, Table *a, ...) {
+        size_t max = 0;
+        va_list ap;
+        int r = 0;
+
+        assert(a);
+
+        /* Make the specified column have the same width in the tables. */
+
+        va_start(ap, a);
+        for (Table *t = a; t; t = va_arg(ap, Table*)) {
+                size_t w;
+
+                r = table_data_requested_width(t, column, &w);
+                if (r < 0)
+                        break;
+
+                max = MAX(max, w);
+        }
+        va_end(ap);
+        if (r < 0)
+                return log_error_errno(r, "Failed to query table column width: %m");
+
+        r = 0;
+        va_start(ap, a);
+        for (Table *t = a; t; t = va_arg(ap, Table*))
+                RET_GATHER(r, table_set_column_width(t, column, max));
+        va_end(ap);
+
+        return r;
+}
+
+int table_print_full(Table *t, FILE *f, bool flush) {
         _cleanup_free_ size_t *sorted = NULL;
-        uint64_t *column_weight, weight_sum;
         int r;
 
         assert(t);
@@ -2292,7 +2260,7 @@ int table_print(Table *t, FILE *f) {
         /* Ensure we have no incomplete rows */
         assert(t->n_cells % t->n_columns == 0);
 
-        n_rows = t->n_cells / t->n_columns;
+        size_t n_rows = t->n_cells / t->n_columns;
         assert(n_rows > 0); /* at least the header row must be complete */
 
         if (t->sort_map) {
@@ -2308,17 +2276,14 @@ int table_print(Table *t, FILE *f) {
                 typesafe_qsort_r(sorted, n_rows, table_data_compare, t);
         }
 
-        if (t->display_map)
-                display_columns = t->n_display_map;
-        else
-                display_columns = t->n_columns;
-
+        size_t display_columns = t->display_map ? t->n_display_map : t->n_columns;
         assert(display_columns > 0);
 
-        minimum_width = newa(size_t, display_columns);
-        maximum_width = newa(size_t, display_columns);
-        requested_width = newa(size_t, display_columns);
-        column_weight = newa0(uint64_t, display_columns);
+        size_t *minimum_width = newa(size_t, display_columns),
+                *maximum_width = newa(size_t, display_columns),
+                *requested_width = newa(size_t, display_columns),
+                *width = NULL;
+        uint64_t *column_weight = newa0(uint64_t, display_columns);
 
         for (size_t j = 0; j < display_columns; j++) {
                 minimum_width[j] = 1;
@@ -2352,7 +2317,7 @@ int table_print(Table *t, FILE *f) {
                                 if (r < 0)
                                         return r;
                                 if (r > 0) { /* Truncated because too many lines? */
-                                        _cleanup_free_ char *last = NULL;
+                                        _cleanup_free_ char *last = NULL, *buffer = NULL;
                                         const char *field;
 
                                         /* If we are going to show only the first few lines of a cell that has
@@ -2360,9 +2325,13 @@ int table_print(Table *t, FILE *f) {
                                          * ellipsis. Hence, let's figure out the last line, and account for its
                                          * length plus ellipsis. */
 
-                                        field = table_data_format(t, d, false,
-                                                                  width ? width[j] : SIZE_MAX,
-                                                                  &any_soft);
+                                        field = table_data_format_strip_ansi(
+                                                        t,
+                                                        d,
+                                                        /* avoid_uppercasing= */ false,
+                                                        width ? width[j] : SIZE_MAX,
+                                                        &any_soft,
+                                                        &buffer);
                                         if (!field)
                                                 return -ENOMEM;
 
@@ -2397,10 +2366,11 @@ int table_print(Table *t, FILE *f) {
                 }
 
                 /* One space between each column */
+                size_t table_requested_width, table_minimum_width, table_maximum_width, table_effective_width;
                 table_requested_width = table_minimum_width = table_maximum_width = display_columns - 1;
 
                 /* Calculate the total weight for all columns, plus the minimum, maximum and requested width for the table. */
-                weight_sum = 0;
+                uint64_t weight_sum = 0;
                 for (size_t j = 0; j < display_columns; j++) {
                         weight_sum += column_weight[j];
 
@@ -2550,7 +2520,7 @@ int table_print(Table *t, FILE *f) {
                         more_sublines = false;
 
                         for (size_t j = 0; j < display_columns; j++) {
-                                _cleanup_free_ char *buffer = NULL, *extracted = NULL;
+                                _cleanup_free_ char *buffer = NULL, *stripped_ansi_buffer = NULL, *extracted = NULL;
                                 bool lines_truncated = false;
                                 const char *field, *color = NULL, *underline = NULL;
                                 TableData *d;
@@ -2558,7 +2528,21 @@ int table_print(Table *t, FILE *f) {
 
                                 assert_se(d = row[t->display_map ? t->display_map[j] : j]);
 
-                                field = table_data_format(t, d, false, width[j], NULL);
+                                if (colors_enabled())
+                                        field = table_data_format(
+                                                        t,
+                                                        d,
+                                                        /* avoid_uppercasing= */ false,
+                                                        width[j],
+                                                        /* have_soft= */ NULL);
+                                else
+                                        field = table_data_format_strip_ansi(
+                                                        t,
+                                                        d,
+                                                        /* avoid_uppercasing= */ false,
+                                                        width[j],
+                                                        /* have_soft= */ NULL,
+                                                        &stripped_ansi_buffer);
                                 if (!field)
                                         return -ENOMEM;
 
@@ -2665,7 +2649,8 @@ int table_print(Table *t, FILE *f) {
 
                                 fputs(field, f);
 
-                                if (color || underline)
+                                /* Reset color afterwards if colors was set or the string to output contained ANSI sequences. */
+                                if (color || underline || (d->type == TABLE_STRING_WITH_ANSI && colors_enabled()))
                                         fputs(ANSI_NORMAL, f);
 
                                 gap_color = d->rgap_color;
@@ -2677,7 +2662,19 @@ int table_print(Table *t, FILE *f) {
                 } while (more_sublines);
         }
 
+        if (!flush)
+                return 0;
+
         return fflush_and_check(f);
+}
+
+int table_print_or_warn(Table *t) {
+        int r;
+
+        r = table_print(t);
+        if (r < 0)
+                return table_log_print_error(r);
+        return 0;
 }
 
 int table_format(Table *t, char **ret) {
@@ -2692,7 +2689,7 @@ int table_format(Table *t, char **ret) {
         if (!f)
                 return -ENOMEM;
 
-        r = table_print(t, f);
+        r = table_print_full(t, f, /* flush= */ true);
         if (r < 0)
                 return r;
 
@@ -2740,7 +2737,7 @@ int table_set_reverse(Table *t, size_t column, bool b) {
         return 0;
 }
 
-TableCell *table_get_cell(Table *t, size_t row, size_t column) {
+TableCell* table_get_cell(Table *t, size_t row, size_t column) {
         size_t i;
 
         assert(t);
@@ -2755,7 +2752,7 @@ TableCell *table_get_cell(Table *t, size_t row, size_t column) {
         return TABLE_INDEX_TO_CELL(i);
 }
 
-const void *table_get(Table *t, TableCell *cell) {
+const void* table_get(Table *t, TableCell *cell) {
         TableData *d;
 
         assert(t);
@@ -2799,6 +2796,12 @@ static int table_data_to_json(TableData *d, sd_json_variant **ret) {
         case TABLE_BOOLEAN_CHECKMARK:
         case TABLE_BOOLEAN:
                 return sd_json_variant_new_boolean(ret, d->boolean);
+
+        case TABLE_TRISTATE:
+                if (d->tristate < 0)
+                        return sd_json_variant_new_null(ret);
+
+                return sd_json_variant_new_boolean(ret, d->tristate);
 
         case TABLE_TIMESTAMP:
         case TABLE_TIMESTAMP_UTC:
@@ -2920,6 +2923,27 @@ static int table_data_to_json(TableData *d, sd_json_variant **ret) {
                                                   SD_JSON_BUILD_UNSIGNED(major(d->devnum)),
                                                   SD_JSON_BUILD_UNSIGNED(minor(d->devnum))));
 
+        case TABLE_JSON:
+                if (!d->json)
+                        return sd_json_variant_new_null(ret);
+
+                if (ret)
+                        *ret = sd_json_variant_ref(d->json);
+
+                return 0;
+
+        case TABLE_STRING_WITH_ANSI: {
+                _cleanup_free_ char *s = strdup(d->string);
+                if (!s)
+                        return -ENOMEM;
+
+                /* We strip the ANSI data when outputting to JSON */
+                if (!strip_tab_ansi(&s, /* isz= */ NULL, /* highlight= */ NULL))
+                        return -ENOMEM;
+
+                return sd_json_variant_new_string(ret, s);
+        }
+
         default:
                 return -EINVAL;
         }
@@ -2963,7 +2987,7 @@ char* table_mangle_to_json_field_name(const char *str) {
 }
 
 static int table_make_json_field_name(Table *t, TableData *d, char **ret) {
-        _cleanup_free_ char *mangled = NULL;
+        _cleanup_free_ char *mangled = NULL, *buffer = NULL;
         const char *n;
 
         assert(t);
@@ -2973,7 +2997,13 @@ static int table_make_json_field_name(Table *t, TableData *d, char **ret) {
         if (IN_SET(d->type, TABLE_HEADER, TABLE_FIELD))
                 n = d->string;
         else {
-                n = table_data_format(t, d, /* avoid_uppercasing= */ true, SIZE_MAX, NULL);
+                n = table_data_format_strip_ansi(
+                                t,
+                                d,
+                                /* avoid_uppercasing= */ true,
+                                /* column_width= */ SIZE_MAX,
+                                /* have_soft= */ NULL,
+                                &buffer);
                 if (!n)
                         return -ENOMEM;
         }
@@ -2986,7 +3016,7 @@ static int table_make_json_field_name(Table *t, TableData *d, char **ret) {
         return 0;
 }
 
-static const char *table_get_json_field_name(Table *t, size_t idx) {
+static const char* table_get_json_field_name(Table *t, size_t idx) {
         assert(t);
 
         return idx < t->n_json_fields ? t->json_fields[idx] : NULL;
@@ -3154,7 +3184,7 @@ int table_print_json(Table *t, FILE *f, sd_json_format_flags_t flags) {
         assert(t);
 
         if (!sd_json_format_enabled(flags)) /* If JSON output is turned off, use regular output */
-                return table_print(t, f);
+                return table_print_full(t, f, /* flush= */ true);
 
         if (!f)
                 f = stdout;

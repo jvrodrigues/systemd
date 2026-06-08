@@ -14,7 +14,7 @@
 #include "generator.h"
 #include "initrd-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mountpoint-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -109,13 +109,9 @@ int generator_add_symlink_full(
          *
          * If <instance> is specified, then <src> must be a template unit name, and we'll instantiate it. */
 
-        r = path_extract_directory(src, &dn);
-        if (r < 0 && r != -EDESTADDRREQ) /* EDESTADDRREQ → just a file name was passed */
-                return log_error_errno(r, "Failed to extract directory name from '%s': %m", src);
-
-        r = path_extract_filename(src, &fn);
+        r = path_split_prefix_filename(src, &dn, &fn);
         if (r < 0)
-                return log_error_errno(r, "Failed to extract file name from '%s': %m", src);
+                return log_error_errno(r, "Failed to split '%s' into directory prefix and filename: %m", src);
         if (r == O_DIRECTORY)
                 return log_error_errno(SYNTHETIC_ERRNO(EISDIR), "Expected path to regular file name, but got '%s', refusing.", src);
 
@@ -233,7 +229,7 @@ static int write_fsck_sysroot_service(
         if (r < 0)
                 return log_error_errno(r, "Failed to convert device \"%s\" to unit name: %m", what);
 
-        r = generator_open_unit_file(dir, /* source = */ NULL, unit, &f);
+        r = generator_open_unit_file(dir, /* source= */ NULL, unit, &f);
         if (r < 0)
                 return r;
 
@@ -494,9 +490,8 @@ int generator_write_network_device_deps(
 
         assert(dir);
         assert(what);
-        assert(where);
 
-        if (fstab_is_extrinsic(where, opts))
+        if (where && fstab_is_extrinsic(where, opts))
                 return 0;
 
         if (!fstab_test_option(opts, "_netdev\0"))
@@ -578,7 +573,7 @@ int generator_hook_up_mkswap(
                 return log_error_errno(r, "Failed to make unit name from path \"%s\": %m",
                                        what);
 
-        r = generator_open_unit_file(dir, /* source = */ NULL, unit, &f);
+        r = generator_open_unit_file(dir, /* source= */ NULL, unit, &f);
         if (r < 0)
                 return r;
 
@@ -660,7 +655,7 @@ int generator_hook_up_mkfs(
                 return log_error_errno(r, "Failed to make unit name from path \"%s\": %m",
                                        where);
 
-        r = generator_open_unit_file(dir, /* source = */ NULL, unit, &f);
+        r = generator_open_unit_file(dir, /* source= */ NULL, unit, &f);
         if (r < 0)
                 return r;
 
@@ -822,12 +817,18 @@ int generator_hook_up_quotacheck(
 
         if (isempty(fstype) || streq(fstype, "auto"))
                 return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Couldn't determine filesystem type for %s, quota cannot be activated", what);
+        if (fstype_has_internal_quota(fstype)) {
+                log_debug("%s handles quotas internally, skipping quotacheck/quotaon setup for %s", fstype, what);
+                return 0;
+        }
         if (!fstype_needs_quota(fstype))
                 return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Quota was requested for %s, but not supported, ignoring: %s", what, fstype);
 
         /* quotacheck unit for system root */
-        if (path_equal(where, "/"))
-                return generator_add_symlink(dir, SPECIAL_LOCAL_FS_TARGET, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_ROOT_SERVICE);
+        if (path_equal(where, "/")) {
+                r = generator_add_symlink(dir, SPECIAL_LOCAL_FS_TARGET, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_ROOT_SERVICE);
+                return r < 0 ? r : 1;
+        }
 
         r = unit_name_path_escape(where, &instance);
         if (r < 0)
@@ -843,7 +844,8 @@ int generator_hook_up_quotacheck(
         if (r < 0)
                 return log_error_errno(r, "Failed to make unit name from path '%s': %m", where);
 
-        return generator_add_symlink_full(dir, where_unit, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_SERVICE, instance);
+        r = generator_add_symlink_full(dir, where_unit, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_SERVICE, instance);
+        return r < 0 ? r : 1;
 }
 
 int generator_hook_up_quotaon(

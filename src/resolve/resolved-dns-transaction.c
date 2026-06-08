@@ -988,8 +988,8 @@ static void dns_transaction_process_dnssec(DnsTransaction *t) {
         if (t->answer_dnssec_result == DNSSEC_INCOMPATIBLE_SERVER &&
             t->scope->dnssec_mode == DNSSEC_YES) {
 
-                /*  We are not in automatic downgrade mode, and the server is bad. Let's try a different server, maybe
-                 *  that works. */
+                /* We are not in automatic downgrade mode, and the server is bad. Let's try a different server, maybe
+                 * that works. */
 
                 if (dns_transaction_limited_retry(t))
                         return;
@@ -1476,7 +1476,7 @@ static int on_dns_packet(sd_event_source *s, int fd, uint32_t revents, void *use
                         assert_se(sd_event_now(t->scope->manager->event, CLOCK_BOOTTIME, &usec) >= 0);
                         dns_server_packet_lost(t->server, IPPROTO_UDP, t->current_feature_level);
 
-                        dns_transaction_close_connection(t, /* use_graveyard = */ false);
+                        dns_transaction_close_connection(t, /* use_graveyard= */ false);
 
                         if (dns_transaction_limited_retry(t)) /* Try a different server */
                                 return 0;
@@ -2073,8 +2073,8 @@ static int dns_transaction_make_packet(DnsTransaction *t) {
         } else {
                 r = dns_packet_new_query(
                                 &p, t->scope->protocol,
-                                /* min_alloc_dsize = */ 0,
-                                /* dnssec_checking_disabled = */ !FLAGS_SET(t->query_flags, SD_RESOLVED_NO_VALIDATE) &&
+                                /* min_alloc_dsize= */ 0,
+                                /* dnssec_checking_disabled= */ !FLAGS_SET(t->query_flags, SD_RESOLVED_NO_VALIDATE) &&
                                                   t->scope->dnssec_mode != DNSSEC_NO);
                 if (r < 0)
                         return r;
@@ -2621,7 +2621,10 @@ int dns_transaction_request_dnssec_keys(DnsTransaction *t) {
                                         continue;
 
                                 /* If we were looking for the DS RR, don't request it again. */
-                                if (dns_transaction_key(t)->type == DNS_TYPE_DS)
+                                r = dns_name_equal(dns_resource_key_name(dns_transaction_key(t)), dns_resource_key_name(rr->key));
+                                if (r < 0)
+                                        return r;
+                                if (r > 0 && dns_transaction_key(t)->type == DNS_TYPE_DS)
                                         continue;
                         }
 
@@ -2836,13 +2839,18 @@ static int dns_transaction_validate_dnskey_by_ds(DnsTransaction *t) {
         DNS_ANSWER_FOREACH_ITEM(item, t->answer) {
 
                 r = dnssec_verify_dnskey_by_ds_search(item->rr, t->validated_keys);
-                if (r < 0)
+                if (r < 0 && r != -EOPNOTSUPP)
                         return r;
                 if (r == 0)
                         continue;
 
-                /* If so, the DNSKEY is validated too. */
-                r = dns_answer_add_extend(&t->validated_keys, item->rr, item->ifindex, item->flags|DNS_ANSWER_AUTHENTICATED, item->rrsig);
+                /* If so, the DNSKEY is validated too, but only mark it authenticated if the DS verification
+                 * succeeded with a known algorithm. */
+                if (r == -EOPNOTSUPP)
+                        r = dns_answer_add_extend(&t->validated_keys, item->rr, item->ifindex, item->flags, NULL);
+                else
+                        r = dns_answer_add_extend(&t->validated_keys, item->rr, item->ifindex, item->flags|DNS_ANSWER_AUTHENTICATED, item->rrsig);
+
                 if (r < 0)
                         return r;
         }
@@ -3259,6 +3267,12 @@ static int dns_transaction_copy_validated(DnsTransaction *t) {
                 if (DNS_TRANSACTION_IS_LIVE(dt->state))
                         continue;
 
+                /* Some of the validated keys may not be authenticated, but are still useful to report
+                 * insecure answers when the domain is signed only by unsupported algorithms. */
+                r = dns_answer_extend(&t->validated_keys, dt->validated_keys);
+                if (r < 0)
+                        return r;
+
                 if (!FLAGS_SET(dt->answer_query_flags, SD_RESOLVED_AUTHENTICATED))
                         continue;
 
@@ -3286,7 +3300,9 @@ static int dnssec_validate_records(
         DnsResourceRecord *rr;
         int r;
 
+        assert(have_nsec);
         assert(nvalidations);
+        assert(validated);
 
         /* Returns negative on error, 0 if validation failed, 1 to restart validation, 2 when finished. */
 
@@ -3478,6 +3494,23 @@ static int dnssec_validate_records(
 
                 /* https://datatracker.ietf.org/doc/html/rfc6840#section-5.2 */
                 if (result == DNSSEC_UNSUPPORTED_ALGORITHM) {
+                        if (rr->key->type == DNS_TYPE_DNSKEY) {
+                                /* This is a DNSKEY we cannot authenticate, but it might still be the best
+                                 * offer from the resolver. Add it to the validated keys in case it's the
+                                 * best we can find, but do not mark it as authenticated.
+                                 */
+
+                                r = dns_answer_copy_by_key(&t->validated_keys, t->answer, rr->key, 0, NULL);
+                                if (r < 0)
+                                        return r;
+
+                                /* Some of the DNSKEYs we just added might already have been revoked,
+                                 * remove them again in that case. */
+                                r = dns_transaction_invalidate_revoked_keys(t);
+                                if (r < 0)
+                                        return r;
+                        }
+
                         r = dns_answer_move_by_key(validated, &t->answer, rr->key, 0, NULL);
                         if (r < 0)
                                 return r;

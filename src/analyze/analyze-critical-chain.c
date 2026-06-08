@@ -67,6 +67,9 @@ static int list_dependencies_compare(char *const *a, char *const *b) {
         usec_t usa = 0, usb = 0;
         UnitTimes *times;
 
+        assert(a);
+        assert(b);
+
         times = hashmap_get(unit_times_hashmap, *a);
         if (times)
                 usa = times->activated;
@@ -98,7 +101,7 @@ static int list_dependencies_one(sd_bus *bus, const char *name, unsigned level, 
 
         typesafe_qsort(deps, strv_length(deps), list_dependencies_compare);
 
-        r = acquire_boot_times(bus, /* require_finished = */ true, &boot);
+        r = acquire_boot_times(bus, /* require_finished= */ true, &boot);
         if (r < 0)
                 return r;
 
@@ -183,7 +186,7 @@ static int list_dependencies(sd_bus *bus, const char *name) {
 
         times = hashmap_get(unit_times_hashmap, id);
 
-        r = acquire_boot_times(bus, /* require_finished = */ true, &boot);
+        r = acquire_boot_times(bus, /* require_finished= */ true, &boot);
         if (r < 0)
                 return r;
 
@@ -201,7 +204,7 @@ static int list_dependencies(sd_bus *bus, const char *name) {
         return list_dependencies_one(bus, name, 0, &units, 0);
 }
 
-int verb_critical_chain(int argc, char *argv[], void *userdata) {
+int verb_critical_chain(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(unit_times_free_arrayp) UnitTimes *times = NULL;
         int n, r;
@@ -210,7 +213,7 @@ int verb_critical_chain(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
 
-        n = acquire_time_data(bus, /* require_finished = */ true, &times);
+        n = acquire_time_data(bus, /* require_finished= */ true, &times);
         if (n <= 0)
                 return n;
 

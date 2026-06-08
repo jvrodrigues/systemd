@@ -1232,7 +1232,7 @@ _public_ int sd_journal_previous_skip(sd_journal *j, uint64_t skip) {
         return real_journal_next_skip(j, DIRECTION_UP, skip);
 }
 
-_public_ int sd_journal_get_cursor(sd_journal *j, char **ret_cursor) {
+_public_ int sd_journal_get_cursor(sd_journal *j, char **ret) {
         Object *o;
         int r;
 
@@ -1246,10 +1246,10 @@ _public_ int sd_journal_get_cursor(sd_journal *j, char **ret_cursor) {
         if (r < 0)
                 return r;
 
-        if (!ret_cursor)
+        if (!ret)
                 return 0;
 
-        if (asprintf(ret_cursor,
+        if (asprintf(ret,
                      "s=%s;i=%"PRIx64";b=%s;m=%"PRIx64";t=%"PRIx64";x=%"PRIx64,
                      SD_ID128_TO_STRING(j->current_file->header->seqnum_id), le64toh(o->entry.seqnum),
                      SD_ID128_TO_STRING(o->entry.boot_id), le64toh(o->entry.monotonic),
@@ -1749,7 +1749,7 @@ static int add_file_by_name(
         if (!path)
                 return -ENOMEM;
 
-        return add_any_file(j, /* fd = */ -EBADF, path);
+        return add_any_file(j, /* fd= */ -EBADF, path);
 }
 
 static int remove_file_by_name(
@@ -2105,7 +2105,7 @@ static int add_directory(
                 goto fail;
         }
 
-        r = add_directory_impl(j, path, /* is_root = */ false, &m);
+        r = add_directory_impl(j, path, /* is_root= */ false, &m);
         if (r < 0)
                 goto fail;
         if (r == 0)
@@ -2187,7 +2187,7 @@ static int add_root_directory(sd_journal *j, const char *p, bool missing_ok) {
                 rewinddir(d);
         }
 
-        r = add_directory_impl(j, p, /* is_root = */ true, &m);
+        r = add_directory_impl(j, p, /* is_root= */ true, &m);
         if (r < 0)
                 goto fail;
         if (r == 0)
@@ -2436,7 +2436,7 @@ _public_ int sd_journal_open_files(sd_journal **ret, const char **paths, int fla
                 return -ENOMEM;
 
         STRV_FOREACH(path, paths) {
-                r = add_any_file(j, /* fd = */ -EBADF, *path);
+                r = add_any_file(j, /* fd= */ -EBADF, *path);
                 if (r < 0)
                         return r;
         }
@@ -2456,7 +2456,6 @@ _public_ int sd_journal_open_files(sd_journal **ret, const char **paths, int fla
 
 _public_ int sd_journal_open_directory_fd(sd_journal **ret, int fd, int flags) {
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
-        struct stat st;
         bool take_fd;
         int r;
 
@@ -2464,11 +2463,9 @@ _public_ int sd_journal_open_directory_fd(sd_journal **ret, int fd, int flags) {
         assert_return(fd >= 0, -EBADF);
         assert_return((flags & ~OPEN_DIRECTORY_FD_ALLOWED_FLAGS) == 0, -EINVAL);
 
-        if (fstat(fd, &st) < 0)
-                return -errno;
-
-        if (!S_ISDIR(st.st_mode))
-                return -EBADFD;
+        r = fd_verify_directory(fd);
+        if (r < 0)
+                return r;
 
         take_fd = FLAGS_SET(flags, SD_JOURNAL_TAKE_DIRECTORY_FD);
         j = journal_new(flags & ~SD_JOURNAL_TAKE_DIRECTORY_FD, NULL, NULL);
@@ -2523,7 +2520,7 @@ _public_ int sd_journal_open_files_fd(sd_journal **ret, int fds[], unsigned n_fd
                 if (r < 0)
                         goto fail;
 
-                r = add_any_file(j, fds[i], /* path = */ NULL);
+                r = add_any_file(j, fds[i], /* path= */ NULL);
                 if (r < 0)
                         goto fail;
         }
@@ -2813,7 +2810,7 @@ static bool field_is_valid(const char *field) {
         return true;
 }
 
-_public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **data, size_t *length) {
+_public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **ret_data, size_t *ret_size) {
         JournalFile *f;
         size_t field_length;
         Object *o;
@@ -2822,8 +2819,6 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
         assert_return(j, -EINVAL);
         assert_return(!journal_origin_changed(j), -ECHILD);
         assert_return(field, -EINVAL);
-        assert_return(data, -EINVAL);
-        assert_return(length, -EINVAL);
         assert_return(field_is_valid(field), -EINVAL);
 
         f = j->current_file;
@@ -2846,7 +2841,8 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
                 size_t l;
 
                 p = journal_file_entry_item_object_offset(f, o, i);
-                r = journal_file_data_payload(f, NULL, p, field, field_length, j->data_threshold, &d, &l);
+                r = journal_file_data_payload(f, NULL, p, field, field_length, j->data_threshold,
+                                              ret_data ? &d : NULL, ret_size ? &l : NULL);
                 if (r == 0)
                         continue;
                 if (IN_SET(r, -EADDRNOTAVAIL, -EBADMSG)) {
@@ -2856,8 +2852,10 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
                 if (r < 0)
                         return r;
 
-                *data = d;
-                *length = l;
+                if (ret_data)
+                        *ret_data = d;
+                if (ret_size)
+                        *ret_size = l;
 
                 return 0;
         }
@@ -2865,15 +2863,15 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
         return -ENOENT;
 }
 
-_public_ int sd_journal_enumerate_data(sd_journal *j, const void **data, size_t *length) {
+_public_ int sd_journal_enumerate_data(sd_journal *j, const void **ret_data, size_t *ret_size) {
         JournalFile *f;
         Object *o;
         int r;
 
         assert_return(j, -EINVAL);
         assert_return(!journal_origin_changed(j), -ECHILD);
-        assert_return(data, -EINVAL);
-        assert_return(length, -EINVAL);
+        assert_return(ret_data, -EINVAL);
+        assert_return(ret_size, -EINVAL);
 
         f = j->current_file;
         if (!f)
@@ -2901,8 +2899,8 @@ _public_ int sd_journal_enumerate_data(sd_journal *j, const void **data, size_t 
                         return r;
                 assert(r > 0);
 
-                *data = d;
-                *length = l;
+                *ret_data = d;
+                *ret_size = l;
 
                 j->current_field++;
 
@@ -2912,11 +2910,11 @@ _public_ int sd_journal_enumerate_data(sd_journal *j, const void **data, size_t 
         return 0;
 }
 
-_public_ int sd_journal_enumerate_available_data(sd_journal *j, const void **data, size_t *length) {
+_public_ int sd_journal_enumerate_available_data(sd_journal *j, const void **ret_data, size_t *ret_size) {
         for (;;) {
                 int r;
 
-                r = sd_journal_enumerate_data(j, data, length);
+                r = sd_journal_enumerate_data(j, ret_data, ret_size);
                 if (r >= 0)
                         return r;
                 if (!JOURNAL_ERRNO_IS_UNAVAILABLE_FIELD(r))
@@ -3164,7 +3162,7 @@ _public_ int sd_journal_wait(sd_journal *j, uint64_t timeout_usec) {
                 if (r < 0)
                         return r;
 
-                /* Server might have done some vacuuming while we weren't watching. Get rid of the deleted
+                /* journald might have done some vacuuming while we weren't watching. Get rid of the deleted
                  * files now so they don't stay around indefinitely. */
                 ORDERED_HASHMAP_FOREACH(f, j->files) {
                         r = journal_file_fstat(f);
@@ -3469,11 +3467,11 @@ _public_ int sd_journal_enumerate_unique(
         }
 }
 
-_public_ int sd_journal_enumerate_available_unique(sd_journal *j, const void **data, size_t *size) {
+_public_ int sd_journal_enumerate_available_unique(sd_journal *j, const void **ret_data, size_t *ret_size) {
         for (;;) {
                 int r;
 
-                r = sd_journal_enumerate_unique(j, data, size);
+                r = sd_journal_enumerate_unique(j, ret_data, ret_size);
                 if (r >= 0)
                         return r;
                 if (!JOURNAL_ERRNO_IS_UNAVAILABLE_FIELD(r))
@@ -3492,12 +3490,12 @@ _public_ void sd_journal_restart_unique(sd_journal *j) {
         j->unique_file_lost = false;
 }
 
-_public_ int sd_journal_enumerate_fields(sd_journal *j, const char **field) {
+_public_ int sd_journal_enumerate_fields(sd_journal *j, const char **ret) {
         int r;
 
         assert_return(j, -EINVAL);
         assert_return(!journal_origin_changed(j), -ECHILD);
-        assert_return(field, -EINVAL);
+        assert_return(ret, -EINVAL);
 
         if (!j->fields_file) {
                 if (j->fields_file_lost)
@@ -3549,7 +3547,7 @@ _public_ int sd_journal_enumerate_fields(sd_journal *j, const char **field) {
                                 /* Proceed with next file */
                                 j->fields_file = ordered_hashmap_next(j->files, f->path);
                                 if (!j->fields_file) {
-                                        *field = NULL;
+                                        *ret = NULL;
                                         return 0;
                                 }
 
@@ -3629,7 +3627,7 @@ _public_ int sd_journal_enumerate_fields(sd_journal *j, const char **field) {
                 if (!field_is_valid(j->fields_buffer))
                         return -EBADMSG;
 
-                *field = j->fields_buffer;
+                *ret = j->fields_buffer;
                 return 1;
         }
 }

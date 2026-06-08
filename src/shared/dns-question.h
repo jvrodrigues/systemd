@@ -5,6 +5,8 @@
 
 #include "shared-forward.h"
 
+#define DNS_QUESTION_ITEMS_MAX 128U
+
 /* A simple array of resource keys */
 
 typedef enum DnsQuestionFlags {
@@ -23,8 +25,7 @@ typedef struct DnsQuestion {
 } DnsQuestion;
 
 DnsQuestion *dns_question_new(size_t n);
-DnsQuestion *dns_question_ref(DnsQuestion *q);
-DnsQuestion *dns_question_unref(DnsQuestion *q);
+DECLARE_TRIVIAL_REF_UNREF_FUNC(DnsQuestion, dns_question);
 
 int dns_question_new_address(DnsQuestion **ret, int family, const char *name, bool convert_idna);
 int dns_question_new_reverse(DnsQuestion **ret, int family, const union in_addr_union *a);

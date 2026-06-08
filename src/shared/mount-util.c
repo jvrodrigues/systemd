@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -20,7 +21,7 @@
 #include "hashmap.h"
 #include "libmount-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
@@ -30,6 +31,7 @@
 #include "process-util.h"
 #include "runtime-scope.h"
 #include "set.h"
+#include "socket-util.h"
 #include "sort-util.h"
 #include "stat-util.h"
 #include "string-util.h"
@@ -449,7 +451,7 @@ int bind_remount_one_with_mountinfo(
 
         rewind(proc_self_mountinfo);
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -847,8 +849,8 @@ int mount_exchange_graceful(int fsmount_fd, const char *dest, bool mount_beneath
          * this is not supported (minimum kernel v6.5), or if there is no mount on the mountpoint, we get
          * -EINVAL and then we fallback to normal mounting. */
 
-        r = RET_NERRNO(move_mount(fsmount_fd, /* from_path = */ "",
-                                  /* to_fd = */ -EBADF, dest,
+        r = RET_NERRNO(move_mount(fsmount_fd, /* from_path= */ "",
+                                  /* to_fd= */ -EBADF, dest,
                                   MOVE_MOUNT_F_EMPTY_PATH | (mount_beneath ? MOVE_MOUNT_BENEATH : 0)));
         if (mount_beneath) {
                 if (r >= 0) /* Mounting beneath worked! Now unmount the upper mount. */
@@ -858,7 +860,7 @@ int mount_exchange_graceful(int fsmount_fd, const char *dest, bool mount_beneath
                         log_debug_errno(r,
                                         "Cannot mount beneath '%s', falling back to overmount: %m",
                                         dest);
-                        return mount_exchange_graceful(fsmount_fd, dest, /* mount_beneath = */ false);
+                        return mount_exchange_graceful(fsmount_fd, dest, /* mount_beneath= */ false);
                 }
         }
 
@@ -898,7 +900,7 @@ int mount_option_mangle(
          * The validity of options stored in '*ret_remaining_options' is not checked.
          * If 'options' is NULL, this just copies 'mount_flags' to *ret_mount_flags. */
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -965,7 +967,7 @@ static int mount_in_namespace_legacy(
         bool mount_slave_created = false, mount_slave_mounted = false,
                 mount_tmp_created = false, mount_tmp_mounted = false,
                 mount_outside_created = false, mount_outside_mounted = false;
-        pid_t child;
+        _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
         int r;
 
         assert(chased_src_path);
@@ -1089,8 +1091,6 @@ static int mount_in_namespace_legacy(
         r = namespace_fork(
                         "(sd-bindmnt)",
                         "(sd-bindmnt-inner)",
-                        /* except_fds= */ NULL,
-                        /* n_except_fds= */ 0,
                         FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM,
                         pidns_fd,
                         mntns_fd,
@@ -1136,7 +1136,7 @@ static int mount_in_namespace_legacy(
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = wait_for_terminate_and_check("(sd-bindmnt)", child, 0);
+        r = pidref_wait_for_terminate_and_check("(sd-bindmnt)", &child, 0);
         if (r < 0) {
                 log_debug_errno(r, "Failed to wait for child: %m");
                 goto finish;
@@ -1200,7 +1200,7 @@ static int mount_in_namespace(
         if (!pidref_is_set(target))
                 return -ESRCH;
 
-        r = pidref_namespace_open(target, &pidns_fd, &mntns_fd, /* ret_netns_fd = */ NULL, /* ret_userns_fd = */ NULL, &root_fd);
+        r = pidref_namespace_open(target, &pidns_fd, &mntns_fd, /* ret_netns_fd= */ NULL, /* ret_userns_fd= */ NULL, &root_fd);
         if (r < 0)
                 return log_debug_errno(r, "Failed to retrieve FDs of the target process' namespace: %m");
 
@@ -1239,7 +1239,7 @@ static int mount_in_namespace(
         _cleanup_(dissected_image_unrefp) DissectedImage *img = NULL;
         _cleanup_close_ int new_mount_fd = -EBADF;
         _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
-        pid_t child;
+        _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
 
         if (flags & MOUNT_IN_NAMESPACE_IS_IMAGE) {
                 r = verity_dissect_and_mount(
@@ -1283,8 +1283,6 @@ static int mount_in_namespace(
 
         r = namespace_fork("(sd-bindmnt)",
                            "(sd-bindmnt-inner)",
-                           /* except_fds= */ NULL,
-                           /* n_except_fds= */ 0,
                            FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM,
                            pidns_fd,
                            mntns_fd,
@@ -1332,7 +1330,7 @@ static int mount_in_namespace(
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = wait_for_terminate_and_check("(sd-bindmnt)", child, 0);
+        r = pidref_wait_for_terminate_and_check("(sd-bindmnt)", &child, 0);
         if (r < 0)
                 return log_debug_errno(r, "Failed to wait for child: %m");
         if (r != EXIT_SUCCESS) {
@@ -1359,8 +1357,8 @@ int bind_mount_in_namespace(
                                   src,
                                   dest,
                                   flags & ~MOUNT_IN_NAMESPACE_IS_IMAGE,
-                                  /* options = */ NULL,
-                                  /* image_policy = */ NULL);
+                                  /* options= */ NULL,
+                                  /* image_policy= */ NULL);
 }
 
 int mount_image_in_namespace(
@@ -1419,6 +1417,103 @@ int fd_make_mount_point(int fd) {
                 return r;
 
         return 1;
+}
+
+int mount_fd_clone(int mount_fd, bool recursive, int *replacement_fd) {
+        const int flags = OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_EMPTY_PATH|(recursive ? AT_RECURSIVE : 0);
+        int r;
+
+        assert(mount_fd >= 0);
+
+        /* If the input mount fd is supposed to remain cloneable after calling this function, call it as
+         * follows: mount_fd_clone(mount_fd, recursive, &mount_fd). */
+
+        /* Clone a detached mount (that may be owned by a foreign mountns, e.g. mountfsd's). For this to
+         * work on older kernels, we have to jump through some hoops, because the kernel currently doesn't
+         * allow us to just call open_tree(OPEN_TREE_CLONE) directly to get a clone of a mount that is
+         * detached and owned by another mountns. Hence here's what we do: we clone short-lived child in a
+         * new mount namespace owned by our userns. There, we attach the mount (invisible to anyone else).
+         * This is sufficient to pass the kernel check, so next we use open_tree(OPEN_TREE_CLONE) to get our
+         * own detached mount. This we send back to the parent, which then can use it. */
+
+        r = RET_NERRNO(open_tree(mount_fd, "", flags));
+        if (r != -EINVAL)
+                /* The straightforward path just works? Yay! Don't bother with the complex logic below. No
+                 * need to put a replacement fd in replacement_fd as the original fd is still usable. */
+                return r;
+
+        _cleanup_close_pair_ int transfer_fds[2] = EBADF_PAIR;
+        r = socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, transfer_fds);
+        if (r < 0)
+                return log_debug_errno(errno, "Failed to create socket pair: %m");
+
+        _cleanup_close_pair_ int errno_pipe_fds[2] = EBADF_PAIR;
+        if (pipe2(errno_pipe_fds, O_CLOEXEC|O_NONBLOCK) < 0)
+                return log_debug_errno(errno, "Failed to open pipe: %m");
+
+        /* Fork a child. Note that we set FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE here, i.e. get a new mount namespace */
+        r = pidref_safe_fork_full(
+                        "(sd-clonemnt)",
+                        /* stdio_fds= */ NULL,
+                        (int[]) { mount_fd, transfer_fds[1], errno_pipe_fds[1] }, 3,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_REOPEN_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE,
+                        /* ret= */ NULL);
+        if (r < 0) {
+                errno_pipe_fds[1] = safe_close(errno_pipe_fds[1]);
+
+                int q = read_errno(errno_pipe_fds[0]);
+                if (q < 0 && q != -EIO)
+                        return q;
+
+                return r;
+        }
+        if (r == 0) { /* Child */
+
+                /* Attach mount */
+                if (move_mount(mount_fd, "", -EBADF, "/", MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+                        log_debug_errno(errno, "Failed to move mount file descriptor to '/': %m");
+                        report_errno_and_exit(errno_pipe_fds[1], -errno);
+                }
+
+                /* If requested by the caller, we clone the fd twice. Why? After move_mount(), the input file
+                 * descriptor can't be move_mount()'ed again, which means we can't clone it again if it comes
+                 * from a different mount namespace. To ensure they can clone the same fd multiple times,
+                 * callers can pass a pointer to the input fd which will be replaced with a second clone,
+                 * which can be move_mount()'ed and thus can be cloned again. */
+
+                for (int i = 0; i < 1 + !!replacement_fd; i++) {
+                        /* And now clone the attached mount that is now ours. */
+                        _cleanup_close_ int cloned_fd = open_tree(mount_fd, "", flags);
+                        if (cloned_fd < 0) {
+                                log_debug_errno(errno, "Failed to clone mount file descriptor: %m");
+                                report_errno_and_exit(errno_pipe_fds[1], -errno);
+                        }
+
+                        /* And send it to the parent. */
+                        r = send_one_fd(transfer_fds[1], cloned_fd, /* flags= */ 0);
+                        if (r < 0)
+                                report_errno_and_exit(errno_pipe_fds[1], r);
+                }
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        transfer_fds[1] = safe_close(transfer_fds[1]);
+
+        /* Accept the new cloned mount */
+        _cleanup_close_ int fd1 = receive_one_fd(transfer_fds[0], 0);
+        if (fd1 < 0)
+                return fd1;
+
+        if (replacement_fd) {
+                int fd2 = receive_one_fd(transfer_fds[0], 0);
+                if (fd2 < 0)
+                        return fd2;
+
+                close_and_replace(*replacement_fd, fd2);
+        }
+
+        return TAKE_FD(fd1);
 }
 
 int make_userns(uid_t uid_shift,
@@ -1653,14 +1748,7 @@ static void sub_mount_clear(SubMount *s) {
         s->mount_fd = safe_close(s->mount_fd);
 }
 
-void sub_mount_array_free(SubMount *s, size_t n) {
-        assert(s || n == 0);
-
-        for (size_t i = 0; i < n; i++)
-                sub_mount_clear(s + i);
-
-        free(s);
-}
+DEFINE_ARRAY_FREE_FUNC(sub_mount_array_free, SubMount, sub_mount_clear);
 
 #if HAVE_LIBMOUNT
 static int sub_mount_compare(const SubMount *a, const SubMount *b) {
@@ -1698,7 +1786,7 @@ int get_sub_mounts(const char *prefix, SubMount **ret_mounts, size_t *ret_n_moun
         assert(ret_mounts);
         assert(ret_n_mounts);
 
-        r = libmount_parse_mountinfo(/* source = */ NULL, &table, &iter);
+        r = libmount_parse_mountinfo(/* source= */ NULL, &table, &iter);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse /proc/self/mountinfo: %m");
 
@@ -1735,13 +1823,11 @@ int get_sub_mounts(const char *prefix, SubMount **ret_mounts, size_t *ret_n_moun
                         continue;
                 }
 
-                mount_fd = open(path, O_CLOEXEC|O_PATH);
-                if (mount_fd < 0) {
-                        if (errno == ENOENT) /* The path may be hidden by another over-mount or already unmounted. */
-                                continue;
-
-                        return log_debug_errno(errno, "Failed to open subtree of mounted filesystem '%s': %m", path);
-                }
+                mount_fd = RET_NERRNO(open_tree(AT_FDCWD, path, OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_RECURSIVE));
+                if (mount_fd == -ENOENT) /* The path may be hidden by another over-mount or already unmounted. */
+                        continue;
+                if (mount_fd < 0)
+                        return log_debug_errno(mount_fd, "Failed to open subtree of mounted filesystem '%s': %m", path);
 
                 p = strdup(path);
                 if (!p)
@@ -1810,9 +1896,7 @@ int bind_mount_submounts(
                         continue;
                 }
 
-                r = mount_follow_verbose(LOG_DEBUG, FORMAT_PROC_FD_PATH(m->mount_fd), t, NULL, MS_BIND|MS_REC, NULL);
-                if (r < 0 && ret == 0)
-                        ret = r;
+                RET_GATHER(ret, RET_NERRNO(move_mount(m->mount_fd, "", AT_FDCWD, t, MOVE_MOUNT_F_EMPTY_PATH)));
         }
 
         return ret;
@@ -1856,7 +1940,7 @@ int trigger_automount_at(int dir_fd, const char *path) {
 
 unsigned long credentials_fs_mount_flags(bool ro) {
         /* A tight set of mount flags for credentials mounts */
-        return MS_NODEV|MS_NOEXEC|MS_NOSUID|ms_nosymfollow_supported()|(ro ? MS_RDONLY : 0);
+        return MS_NODEV|MS_NOEXEC|MS_NOSUID|MS_NOSYMFOLLOW|(ro ? MS_RDONLY : 0);
 }
 
 int fsmount_credentials_fs(int *ret_fsfd) {
@@ -1897,10 +1981,19 @@ int fsmount_credentials_fs(int *ret_fsfd) {
         if (fsconfig(fs_fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0)
                 return -errno;
 
-        int mfd = fsmount(fs_fd, FSMOUNT_CLOEXEC,
-                          ms_flags_to_mount_attr(credentials_fs_mount_flags(/* ro = */ false)));
+        unsigned mount_attrs = ms_flags_to_mount_attr(credentials_fs_mount_flags(/* ro = */ false));
+
+        int mfd = RET_NERRNO(fsmount(fs_fd, FSMOUNT_CLOEXEC, mount_attrs));
+        if (mfd == -EINVAL) {
+                /* MS_NOSYMFOLLOW was added in kernel 5.10, but the new mount API counterpart was missing
+                 * until 5.14 (c.f. https://github.com/torvalds/linux/commit/dd8b477f9a3d8edb136207acb3652e1a34a661b7).
+                 *
+                 * TODO: drop this once our baseline is raised to 5.14 */
+                assert(FLAGS_SET(mount_attrs, MOUNT_ATTR_NOSYMFOLLOW));
+                mfd = RET_NERRNO(fsmount(fs_fd, FSMOUNT_CLOEXEC, mount_attrs & ~MOUNT_ATTR_NOSYMFOLLOW));
+        }
         if (mfd < 0)
-                return -errno;
+                return mfd;
 
         if (ret_fsfd)
                 *ret_fsfd = TAKE_FD(fs_fd);
@@ -1913,7 +2006,7 @@ int mount_credentials_fs(const char *path) {
 
         assert(path);
 
-        mfd = fsmount_credentials_fs(/* ret_fsfd = */ NULL);
+        mfd = fsmount_credentials_fs(/* ret_fsfd= */ NULL);
         if (mfd < 0)
                 return mfd;
 
@@ -1967,7 +2060,7 @@ int make_fsmount(
 
                 r = extract_first_word(&p, &word, ",", EXTRACT_KEEP_QUOTE);
                 if (r < 0)
-                        return log_full_errno(error_log_level, r, "Failed to parse mount option string \"%s\": %m", o);
+                        return log_full_errno(error_log_level, r, "Failed to parse mount option string \"%s\": %m", strempty(o));
                 if (r == 0)
                         break;
 
@@ -2058,7 +2151,7 @@ int path_get_mount_info_at(
         if (ret_options)
                 r = libmount_parse_with_utab(&table, &iter);
         else
-                r = libmount_parse_mountinfo(/* source = */ NULL, &table, &iter);
+                r = libmount_parse_mountinfo(/* source= */ NULL, &table, &iter);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse /proc/self/mountinfo: %m");
 
@@ -2125,7 +2218,7 @@ int path_is_network_fs_harder_at(int dir_fd, const char *path) {
                 return r;
 
         _cleanup_free_ char *fstype = NULL, *options = NULL;
-        r = path_get_mount_info_at(fd, /* path = */ NULL, &fstype, &options, /* ret_source = */ NULL);
+        r = path_get_mount_info_at(fd, /* path= */ NULL, &fstype, &options, /* ret_source= */ NULL);
         if (r < 0)
                 return r;
 

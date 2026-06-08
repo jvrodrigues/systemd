@@ -69,6 +69,20 @@ typedef void (*_sd_destroy_t)(void *userdata);
 #  define _SD_STRINGIFY(x) _SD_XSTRINGIFY(x)
 #endif
 
+/* Mirror of CONCATENATE / UNIQ from macro-fundamental.h, available to public sd-* headers. */
+#ifndef _SD_CONCATENATE
+#  define _SD_XCONCATENATE(x, y) x ## y
+#  define _SD_CONCATENATE(x, y) _SD_XCONCATENATE(x, y)
+#endif
+
+#ifndef _SD_UNIQ
+#  ifdef __COUNTER__
+#    define _SD_UNIQ __COUNTER__
+#  else
+#    define _SD_UNIQ __LINE__
+#  endif
+#endif
+
 #ifndef _SD_BEGIN_DECLARATIONS
 #  ifdef __cplusplus
 #    define _SD_BEGIN_DECLARATIONS                              \
@@ -105,6 +119,16 @@ typedef void (*_sd_destroy_t)(void *userdata);
                         func(*p);                               \
         }                                                       \
         struct _sd_useless_struct_to_allow_trailing_semicolon_
+
+#define _SD_DECLARE_TRIVIAL_REF_FUNC(name) \
+        name* name##_ref(name *p)
+
+#define _SD_DECLARE_TRIVIAL_UNREF_FUNC(name) \
+        name* name##_unref(name *p)
+
+#define _SD_DECLARE_TRIVIAL_REF_UNREF_FUNC(name)      \
+        _SD_DECLARE_TRIVIAL_REF_FUNC(name);           \
+        _SD_DECLARE_TRIVIAL_UNREF_FUNC(name)
 
 /* The following macro should be used in all public enums, to force 64-bit wideness on them, so that we can
  * freely extend them later on, without breaking compatibility. */

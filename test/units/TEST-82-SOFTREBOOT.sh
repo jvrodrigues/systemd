@@ -190,6 +190,17 @@ elif [ -f /run/TEST-82-SOFTREBOOT.touch ]; then
     test "$(systemctl show -P ActiveState TEST-82-SOFTREBOOT-nosurvive-sigterm.service)" != "active"
     test "$(systemctl show -P ActiveState TEST-82-SOFTREBOOT-nosurvive.service)" != "active"
 
+    # Regression test for #41789: the lingering user enabled on the first boot must
+    # have its user@.service started again after the soft reboot. Before the fix it
+    # was GC'd at logind startup and never restarted. Disable lingering again here,
+    # before the nextroot switch below (the third boot runs on a minimal overlay
+    # rootfs that does not have this user). terminate-user is best-effort: it can
+    # race the asynchronous disable-linger/UserStopDelaySec teardown.
+    linger_uid=$(id -u testuser)
+    timeout 30 bash -c "until systemctl is-active --quiet user@${linger_uid}.service; do sleep 1; done"
+    loginctl disable-linger testuser
+    loginctl terminate-user testuser || true
+
     # This time we test the /run/nextroot/ root switching logic. (We synthesize a new rootfs from the old via overlayfs)
     mkdir -p /run/nextroot /tmp/nextroot-lower /original-root
     mount -t tmpfs tmpfs /tmp/nextroot-lower
@@ -253,7 +264,9 @@ EOF
 #!/usr/bin/env bash
 systemd-notify --ready
 rm "$survive_argv"
-exec -a @sleep sleep infinity
+# Here, we use our own sleep implementation, to support coreutils built with
+#  --enable-single-binary=symlinks, in that case we cannot rename COMM of sleep command.
+exec -a @sleep /usr/lib/systemd/tests/unit-tests/manual/test-sleep infinity
 EOF
     chmod +x "$survive_argv"
     # This sets DefaultDependencies=no so that they remain running until the very end, and
@@ -272,6 +285,8 @@ EOF
     # '@', and the second will use SurviveFinalKillSignal=yes. Both should survive.
     # By writing to stdout, which is connected to the journal, we also ensure logging doesn't break across
     # soft reboots due to journald being temporarily stopped.
+    # Note, when coreutils is built with --enable-single-binary=symlinks, unfortunately we cannot freely rename
+    # sleep command, hence we cannot test the feature.
     systemd-run --service-type=notify --unit=TEST-82-SOFTREBOOT-survive-argv.service \
         --property SurviveFinalKillSignal=no \
         --property IgnoreOnIsolate=yes \
@@ -280,7 +295,7 @@ EOF
         --property "Conflicts=reboot.target kexec.target poweroff.target halt.target emergency.target rescue.target" \
         --property "Before=reboot.target kexec.target poweroff.target halt.target emergency.target rescue.target" \
         --property SetCredential=preserve:yay \
-         "$survive_argv"
+        "$survive_argv"
     # shellcheck disable=SC2016
     systemd-run --service-type=exec --unit=TEST-82-SOFTREBOOT-survive.service \
         --property TemporaryFileSystem="/run /tmp /var" \
@@ -308,6 +323,18 @@ EOF
         # used instead of the bus ID)
         systemd-run --wait false || true
     done
+
+    # Regression test for #41789: a lingering user's user@.service must come back
+    # after a soft reboot, the same way it does after a hardware reboot. It used
+    # to be garbage-collected at logind startup (before user_start() ran), because
+    # /run/systemd/users is preserved across soft-reboot and fed the user into the
+    # GC queue while its units were not active yet. Enable lingering for the
+    # pre-existing testuser here; the second boot asserts the service is active
+    # again. testuser lives in the persistent rootfs, so it survives the
+    # (non-nextroot) soft reboot into the second boot.
+    loginctl enable-linger testuser
+    linger_uid=$(id -u testuser)
+    timeout 30 bash -c "until systemctl is-active --quiet user@${linger_uid}.service; do sleep 1; done"
 
     trigger_uevent
 

@@ -68,8 +68,6 @@ static void fallback_random_bytes(void *p, size_t n) {
 }
 
 void random_bytes(void *p, size_t n) {
-        static bool have_grndinsecure = true;
-
         assert(p || n == 0);
 
         if (n == 0)
@@ -78,15 +76,9 @@ void random_bytes(void *p, size_t n) {
         for (;;) {
                 ssize_t l;
 
-                l = getrandom(p, n, have_grndinsecure ? GRND_INSECURE : GRND_NONBLOCK);
-                if (l < 0 && errno == EINVAL && have_grndinsecure) {
-                        /* No GRND_INSECURE; fallback to GRND_NONBLOCK. */
-                        have_grndinsecure = false;
-                        continue;
-                }
+                l = getrandom(p, n, GRND_INSECURE);
                 if (l <= 0)
-                        break; /* Will block (with GRND_NONBLOCK), or unexpected error. Give up and fallback
-                                  to /dev/urandom. */
+                        break; /* Unexpected error. Give up and fallback to /dev/urandom. */
 
                 if ((size_t) l == n)
                         return; /* Done reading, success. */
@@ -102,6 +94,19 @@ void random_bytes(void *p, size_t n) {
 
         /* This is a terrible fallback. Oh well. */
         fallback_random_bytes(p, n);
+}
+
+int random_bytes_allocate_iovec(size_t n, struct iovec *ret) {
+        assert(ret);
+
+        void *p = malloc(MAX(n, 1U));
+        if (!p)
+                return -ENOMEM;
+
+        random_bytes(p, n);
+
+        *ret = IOVEC_MAKE(TAKE_PTR(p), n);
+        return 0;
 }
 
 int crypto_random_bytes(void *p, size_t n) {

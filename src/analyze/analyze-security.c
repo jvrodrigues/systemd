@@ -3,6 +3,7 @@
 #include <linux/capability.h>
 
 #include "sd-bus.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "analyze-verify-util.h"
@@ -557,6 +558,8 @@ static int assess_system_call_architectures(
 }
 
 static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilterSet *f, const char **ret_offending_syscall) {
+        assert(ret_offending_syscall);
+
         NULSTR_FOREACH(syscall, f->value) {
                 if (syscall[0] == '@') {
                         const SyscallFilterSet *g;
@@ -574,8 +577,7 @@ static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilter
 
                 if (set_contains(s, syscall) == allow_list) {
                         log_debug("Offending syscall filter item: %s", syscall);
-                        if (ret_offending_syscall)
-                                *ret_offending_syscall = syscall;
+                        *ret_offending_syscall = syscall;
                         return true; /* bad! */
                 }
         }
@@ -603,7 +605,7 @@ static int assess_system_call_filter(
         uint64_t b;
         int r;
 
-        r = dlopen_libseccomp();
+        r = DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0) {
                 *ret_badness = UINT64_MAX;
                 *ret_description = NULL;
@@ -1884,7 +1886,7 @@ static int assess(const SecurityInfo *info,
                                 return log_error_errno(r, "Failed to set columns to display: %m");
                 }
 
-                r = table_print_with_pager(details_table, json_format_flags, pager_flags, /* show_header= */true);
+                r = table_print_with_pager(details_table, json_format_flags, pager_flags, /* show_header= */ true);
                 if (r < 0)
                         return r;
         }
@@ -2576,7 +2578,7 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
                 info->_umask = c->umask;
 
 #if HAVE_SECCOMP
-                if (dlopen_libseccomp() >= 0) {
+                if (DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED) >= 0) {
                         SET_FOREACH(key, c->syscall_archs) {
                                 const char *name;
 
@@ -2711,7 +2713,7 @@ static int offline_security_checks(
 
         log_debug("Starting manager...");
 
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 
@@ -2752,7 +2754,7 @@ static int offline_security_checks(
                         (void) mkdir_parents(dropin, 0755);
 
                         if (!is_path(profile)) {
-                                r = find_portable_profile(profile, unit_name, &profile_path);
+                                r = find_portable_profile(scope, profile, unit_name, &profile_path);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to find portable profile %s: %m", profile);
                                 profile = profile_path;
@@ -2897,14 +2899,14 @@ static int analyze_security(sd_bus *bus,
                         fflush(stdout);
                 }
 
-                r = table_print_with_pager(overview_table, json_format_flags, pager_flags, /* show_header= */true);
+                r = table_print_with_pager(overview_table, json_format_flags, pager_flags, /* show_header= */ true);
                 if (r < 0)
                         return r;
         }
         return ret;
 }
 
-int verb_security(int argc, char *argv[], void *userdata) {
+int verb_security(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *policy = NULL;
         int r;
@@ -2919,19 +2921,19 @@ int verb_security(int argc, char *argv[], void *userdata) {
 
         unsigned line = 0, column = 0;
         if (arg_security_policy) {
-                r = sd_json_parse_file(/*f=*/ NULL, arg_security_policy, /*flags=*/ 0, &policy, &line, &column);
+                r = sd_json_parse_file(/* f= */ NULL, arg_security_policy, SD_JSON_PARSE_MUST_BE_OBJECT, &policy, &line, &column);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse '%s' at %u:%u: %m", arg_security_policy, line, column);
         } else {
                 _cleanup_fclose_ FILE *f = NULL;
                 _cleanup_free_ char *pp = NULL;
 
-                r = search_and_fopen_nulstr("systemd-analyze-security.policy", "re", /*root=*/ NULL, CONF_PATHS_NULSTR("systemd"), &f, &pp);
+                r = search_and_fopen_nulstr("systemd-analyze-security.policy", "re", /* root= */ NULL, CONF_PATHS_NULSTR("systemd"), &f, &pp);
                 if (r < 0 && r != -ENOENT)
                         return r;
 
                 if (f) {
-                        r = sd_json_parse_file(f, pp, /*flags=*/ 0, &policy, &line, &column);
+                        r = sd_json_parse_file(f, pp, SD_JSON_PARSE_MUST_BE_OBJECT, &policy, &line, &column);
                         if (r < 0)
                                 return log_error_errno(r, "[%s:%u:%u] Failed to parse JSON policy: %m", pp, line, column);
                 }
@@ -2950,5 +2952,5 @@ int verb_security(int argc, char *argv[], void *userdata) {
                         arg_profile,
                         arg_json_format_flags,
                         arg_pager_flags,
-                        /*flags=*/ 0);
+                        /* flags= */ 0);
 }

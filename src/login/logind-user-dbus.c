@@ -144,7 +144,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", user_get_idle_hint(u, NULL) > 0);
+        return sd_bus_message_append(reply, "b", user_get_idle_hint(u, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_idle_since_hint(
@@ -163,7 +163,7 @@ static int property_get_idle_since_hint(
         assert(bus);
         assert(reply);
 
-        (void) user_get_idle_hint(u, &t);
+        user_get_idle_hint(u, &t);
         k = streq(property, "IdleSinceHint") ? t.realtime : t.monotonic;
 
         return sd_bus_message_append(reply, "t", k);
@@ -208,7 +208,7 @@ int bus_user_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = user_stop(u, /* force = */ true);
+        r = user_stop(u, /* force= */ true);
         if (r < 0)
                 return r;
 

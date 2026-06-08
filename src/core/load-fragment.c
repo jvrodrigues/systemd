@@ -10,7 +10,6 @@
 #include "sd-bus.h"
 #include "sd-messages.h"
 
-#include "af-list.h"
 #include "all-units.h"
 #include "alloc-util.h"
 #include "bpf-program.h"
@@ -57,7 +56,7 @@
 #include "reboot-util.h"
 #include "seccomp-util.h"
 #include "securebits-util.h"
-#include "selinux-util.h"
+#include "selinux-util.h"               /* IWYU pragma: keep */
 #include "set.h"
 #include "show-status.h"
 #include "signal-util.h"
@@ -88,6 +87,8 @@ static int parse_socket_protocol(const char *s) {
 int parse_crash_chvt(const char *value, int *data) {
         int b;
 
+        assert(data);
+
         if (safe_atoi(value, data) >= 0)
                 return 0;
 
@@ -106,6 +107,8 @@ int parse_crash_chvt(const char *value, int *data) {
 int parse_confirm_spawn(const char *value, char **console) {
         char *s;
         int r;
+
+        assert(console);
 
         r = value ? parse_boolean(value) : 1;
         if (r == 0) {
@@ -128,6 +131,7 @@ DEFINE_CONFIG_PARSE(config_parse_socket_protocol, parse_socket_protocol);
 DEFINE_CONFIG_PARSE(config_parse_exec_secure_bits, secure_bits_from_string);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_collect_mode, collect_mode, CollectMode);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_device_policy, cgroup_device_policy, CGroupDevicePolicy);
+DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_cpuset_partition, cpuset_partition, CPUSetPartition, _CPUSET_PARTITION_INVALID);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_exec_keyring_mode, exec_keyring_mode, ExecKeyringMode);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_protect_proc, protect_proc, ProtectProc);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_proc_subset, proc_subset, ProcSubset);
@@ -150,7 +154,7 @@ DEFINE_CONFIG_PARSE_ENUM(config_parse_service_timeout_failure_mode, service_time
 DEFINE_CONFIG_PARSE_ENUM(config_parse_socket_bind, socket_address_bind_ipv6_only_or_bool, SocketAddressBindIPv6Only);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_oom_policy, oom_policy, OOMPolicy);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_managed_oom_preference, managed_oom_preference, ManagedOOMPreference);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_memory_pressure_watch, cgroup_pressure_watch, CGroupPressureWatch);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_pressure_watch, cgroup_pressure_watch, CGroupPressureWatch);
 DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_ip_tos, ip_tos, int, -1);
 DEFINE_CONFIG_PARSE_PTR(config_parse_cg_weight, cg_weight_parse, uint64_t);
 DEFINE_CONFIG_PARSE_PTR(config_parse_cg_cpu_weight, cg_cpu_weight_parse, uint64_t);
@@ -163,6 +167,7 @@ DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_commands, bpf_delegate_command
 DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_maps, bpf_delegate_maps_from_string, uint64_t);
 DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_programs, bpf_delegate_programs_from_string, uint64_t);
 DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_attachments, bpf_delegate_attachments_from_string, uint64_t);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_exec_memory_thp, exec_memory_thp, ExecMemoryTHP);
 
 bool contains_instance_specifier_superset(const char *s) {
         const char *p, *q;
@@ -563,6 +568,8 @@ static int patch_var_run(
 
         const char *e;
         char *z;
+
+        assert(path);
 
         e = path_startswith(*path, "/var/run/");
         if (!e)
@@ -984,7 +991,7 @@ int config_parse_exec(
                                            ignore ? ", ignoring" : "", rvalue);
                                 return ignore ? 0 : -ENOEXEC;
                         }
-                        if (!string_is_safe(path)) {
+                        if (!string_is_safe(path, /* flags= */ 0)) {
                                 log_syntax(unit, ignore ? LOG_WARNING : LOG_ERR, filename, line, 0,
                                            "Executable path contains special characters%s: %s",
                                            ignore ? ", ignoring" : "", path);
@@ -1015,7 +1022,7 @@ int config_parse_exec(
                         /* Check explicitly for an unquoted semicolon as command separator token. */
                         if (p[0] == ';' && (!p[1] || strchr(WHITESPACE, p[1]))) {
                                 p++;
-                                p = skip_leading_chars(p, /* bad = */ NULL);
+                                p = skip_leading_chars(p, /* bad= */ NULL);
                                 semicolon = true;
                                 break;
                         }
@@ -1024,7 +1031,7 @@ int config_parse_exec(
                          * extract_first_word() would return the same for all of those. */
                         if (p[0] == '\\' && p[1] == ';' && (!p[2] || strchr(WHITESPACE, p[2]))) {
                                 p += 2;
-                                p = skip_leading_chars(p, /* bad = */ NULL);
+                                p = skip_leading_chars(p, /* bad= */ NULL);
 
                                 if (strv_extend(&args, ";") < 0)
                                         return log_oom();
@@ -1539,9 +1546,12 @@ int config_parse_exec_cpu_sched_policy(
                 return 0;
         }
 
+        if (!sched_policy_supported(x))
+                log_syntax(unit, LOG_WARNING, filename, line, x, "Unsupported CPU scheduling policy: %s", rvalue);
+
         c->cpu_sched_policy = x;
         /* Moving to or from real-time policy? We need to adjust the priority */
-        c->cpu_sched_priority = CLAMP(c->cpu_sched_priority, sched_get_priority_min(x), sched_get_priority_max(x));
+        c->cpu_sched_priority = CLAMP(c->cpu_sched_priority, sched_get_priority_min_safe(x), sched_get_priority_max_safe(x));
         c->cpu_sched_set = true;
 
         return 0;
@@ -1659,7 +1669,6 @@ int config_parse_root_image_options(
         }
 
         STRV_FOREACH_PAIR(first, second, l) {
-                MountOptions *o = NULL;
                 _cleanup_free_ char *mount_options_resolved = NULL;
                 const char *mount_options = NULL, *partition = "root";
                 PartitionDesignator partition_designator;
@@ -1683,23 +1692,12 @@ int config_parse_root_image_options(
                         continue;
                 }
 
-                o = new(MountOptions, 1);
-                if (!o)
-                        return log_oom();
-                *o = (MountOptions) {
-                        .partition_designator = partition_designator,
-                        .options = TAKE_PTR(mount_options_resolved),
-                };
-                LIST_APPEND(mount_options, options, TAKE_PTR(o));
+                r = mount_options_set_and_consume(&options, partition_designator, TAKE_PTR(mount_options_resolved));
+                if (r < 0)
+                        return r;
         }
 
-        if (options)
-                LIST_JOIN(mount_options, c->root_image_options, options);
-        else
-                /* empty spaces/separators only */
-                c->root_image_options = mount_options_free_all(c->root_image_options);
-
-        return 0;
+        return free_and_replace_full(c->root_image_options, options, mount_options_free_all);
 }
 
 int config_parse_exec_root_hash(
@@ -2817,7 +2815,7 @@ int config_parse_pass_environ(
                         return log_oom();
         }
 
-        r = strv_extend_strv_consume(passenv, TAKE_PTR(n), /* filter_duplicates = */ true);
+        r = strv_extend_strv_consume(passenv, TAKE_PTR(n), /* filter_duplicates= */ true);
         if (r < 0)
                 return log_oom();
 
@@ -2886,7 +2884,7 @@ int config_parse_unset_environ(
                         return log_oom();
         }
 
-        r = strv_extend_strv_consume(unsetenv, TAKE_PTR(n), /* filter_duplicates = */ true);
+        r = strv_extend_strv_consume(unsetenv, TAKE_PTR(n), /* filter_duplicates= */ true);
         if (r < 0)
                 return log_oom();
 
@@ -2947,6 +2945,11 @@ int config_parse_log_extra_fields(
                 if (!journal_field_valid(k, eq-k, false)) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0, "Log field name is invalid, ignoring: %s", k);
                         continue;
+                }
+
+                if (c->n_log_extra_fields >= LOG_EXTRA_FIELDS_MAX) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Too many extra log fields, ignoring some.");
+                        return 0;
                 }
 
                 if (!GREEDY_REALLOC(c->log_extra_fields, c->n_log_extra_fields + 1))
@@ -3471,72 +3474,26 @@ int config_parse_address_families(
                 void *userdata) {
 
         ExecContext *c = data;
-        bool invert = false;
+        bool is_allowlist = c->address_families_allow_list;
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
 
-        if (isempty(rvalue)) {
-                /* Empty assignment resets the list */
-                c->address_families = set_free(c->address_families);
-                c->address_families_allow_list = false;
+        r = parse_address_families(rvalue, &c->address_families, &is_allowlist);
+        /* Copy back unconditionally: parse_address_families() may have partially populated
+         * c->address_families before failing, so keep is_allowlist in sync with that state. */
+        c->address_families_allow_list = is_allowlist;
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse address family, ignoring: %s", rvalue);
                 return 0;
         }
 
-        if (streq(rvalue, "none")) {
-                /* Forbid all address families. */
-                c->address_families = set_free(c->address_families);
-                c->address_families_allow_list = true;
-                return 0;
-        }
-
-        if (rvalue[0] == '~') {
-                invert = true;
-                rvalue++;
-        }
-
-        if (!c->address_families) {
-                c->address_families = set_new(NULL);
-                if (!c->address_families)
-                        return log_oom();
-
-                c->address_families_allow_list = !invert;
-        }
-
-        for (const char *p = rvalue;;) {
-                _cleanup_free_ char *word = NULL;
-                int af;
-
-                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
-                if (r == -ENOMEM)
-                        return log_oom();
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Invalid syntax, ignoring: %s", rvalue);
-                        return 0;
-                }
-                if (r == 0)
-                        return 0;
-
-                af = af_from_name(word);
-                if (af < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, af,
-                                   "Failed to parse address family, ignoring: %s", word);
-                        continue;
-                }
-
-                /* If we previously wanted to forbid an address family and now
-                 * we want to allow it, then just remove it from the list.
-                 */
-                if (!invert == c->address_families_allow_list)  {
-                        r = set_put(c->address_families, INT_TO_PTR(af));
-                        if (r < 0)
-                                return log_oom();
-                } else
-                        set_remove(c->address_families, INT_TO_PTR(af));
-        }
+        return 0;
 }
 #endif
 
@@ -3798,9 +3755,7 @@ int config_parse_memory_limit(
         uint64_t bytes = CGROUP_LIMIT_MAX;
         int r;
 
-        if (isempty(rvalue) && STR_IN_SET(lvalue, "DefaultMemoryLow",
-                                                  "DefaultMemoryMin",
-                                                  "MemoryLow",
+        if (isempty(rvalue) && STR_IN_SET(lvalue, "MemoryLow",
                                                   "StartupMemoryLow",
                                                   "MemoryMin"))
                 bytes = CGROUP_LIMIT_MIN;
@@ -3824,31 +3779,17 @@ int config_parse_memory_limit(
                                                "StartupMemoryZSwapMax",
                                                "MemoryLow",
                                                "StartupMemoryLow",
-                                               "MemoryMin",
-                                               "DefaultMemoryLow",
-                                               "DefaultstartupMemoryLow",
-                                               "DefaultMemoryMin"))) {
+                                               "MemoryMin"))) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0, "Memory limit '%s' out of range, ignoring.", rvalue);
                         return 0;
                 }
         }
 
-        if (streq(lvalue, "DefaultMemoryLow")) {
-                c->default_memory_low = bytes;
-                c->default_memory_low_set = true;
-        } else if (streq(lvalue, "DefaultStartupMemoryLow")) {
-                c->default_startup_memory_low = bytes;
-                c->default_startup_memory_low_set = true;
-        } else if (streq(lvalue, "DefaultMemoryMin")) {
-                c->default_memory_min = bytes;
-                c->default_memory_min_set = true;
-        } else if (streq(lvalue, "MemoryMin")) {
+        if (streq(lvalue, "MemoryMin"))
                 c->memory_min = bytes;
-                c->memory_min_set = true;
-        } else if (streq(lvalue, "MemoryLow")) {
+        else if (streq(lvalue, "MemoryLow"))
                 c->memory_low = bytes;
-                c->memory_low_set = true;
-        } else if (streq(lvalue, "StartupMemoryLow")) {
+        else if (streq(lvalue, "StartupMemoryLow")) {
                 c->startup_memory_low = bytes;
                 c->startup_memory_low_set = true;
         } else if (streq(lvalue, "MemoryHigh"))
@@ -4146,6 +4087,65 @@ int config_parse_managed_oom_mem_pressure_duration_sec(
                 return log_syntax(unit, LOG_WARNING, filename, line, 0, "%s= must be at least 1s and less than infinity, ignoring: %s", lvalue, rvalue);
 
         *duration = usec;
+        return 0;
+}
+
+int config_parse_managed_oom_rules(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char ***sv = ASSERT_PTR(data);
+        UnitType t;
+        int r;
+
+        assert(rvalue);
+
+        t = unit_name_to_type(unit);
+        assert(t != _UNIT_TYPE_INVALID);
+
+        if (!unit_vtable[t]->can_set_managed_oom)
+                return log_syntax(unit, LOG_WARNING, filename, line, 0, "%s= is not supported for this unit type, ignoring.", lvalue);
+
+        if (isempty(rvalue)) {
+                *sv = strv_free(*sv);
+                return 0;
+        }
+
+        /* Tokenize once: validate each rule name (rulesets are loaded from .oomrule files)
+         * and accumulate into a local strv. Invalid rule names are skipped individually
+         * with a warning so the rest of the line still applies. */
+        _cleanup_strv_free_ char **strv = NULL;
+        for (const char *p = rvalue;;) {
+                _cleanup_free_ char *word = NULL;
+
+                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
+                if (r == 0)
+                        break;
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
+
+                if (!string_is_safe(word, STRING_FILENAME)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid rule name in %s=, ignoring: %s", lvalue, word);
+                        continue;
+                }
+
+                r = strv_consume(&strv, TAKE_PTR(word));
+                if (r < 0)
+                        return log_oom();
+        }
+
+        r = strv_extend_strv_consume(sv, TAKE_PTR(strv), /* filter_duplicates= */ ltype);
+        if (r < 0)
+                return log_oom();
+
         return 0;
 }
 
@@ -4592,7 +4592,7 @@ int config_parse_exec_quota(
                 void *data,
                 void *userdata) {
 
-        QuotaLimit *quota_limit = ASSERT_PTR(data);
+        ExecQuotaLimit *quota_limit = ASSERT_PTR(data);
         uint64_t quota_absolute = UINT64_MAX;
         uint32_t quota_scale = UINT32_MAX;
         int r;
@@ -4678,7 +4678,7 @@ int config_parse_set_credential(
         size_t size;
 
         if (encrypted) {
-                r = unbase64mem_full(p, SIZE_MAX, /* secure = */ true, &d, &size);
+                r = unbase64mem_full(p, SIZE_MAX, /* secure= */ true, &d, &size);
                 if (r == -ENOMEM)
                         return log_oom();
                 if (r < 0) {
@@ -4837,6 +4837,55 @@ int config_parse_import_credential(
         if (r < 0)
                 return log_error_errno(r, "Failed to store import credential '%s': %m", rvalue);
 
+        return 0;
+}
+
+int config_parse_service_refresh_on_reload(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Service *s = ASSERT_PTR(userdata);
+        int r;
+
+        if (isempty(rvalue)) {
+                s->refresh_on_reload_set = false;
+                return 0;
+        }
+
+        r = parse_boolean(rvalue);
+        if (r >= 0) {
+                s->refresh_on_reload_flags = r > 0 ? _SERVICE_REFRESH_ON_RELOAD_ALL : 0;
+                s->refresh_on_reload_set = true;
+                return 0;
+        }
+
+        ServiceRefreshOnReload f;
+        bool invert = false;
+
+        if (rvalue[0] == '~') {
+                invert = true;
+                rvalue++;
+        }
+
+        r = service_refresh_on_reload_from_string_many(rvalue, &f);
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
+
+        /* If the first entry is negated, mask off from default; otherwise assign "positive" values directly */
+        if (!s->refresh_on_reload_set)
+                s->refresh_on_reload_flags = invert ? (SERVICE_REFRESH_ON_RELOAD_DEFAULT & ~f) : f;
+        else
+                SET_FLAG(s->refresh_on_reload_flags, f, !invert);
+
+        s->refresh_on_reload_set = true;
         return 0;
 }
 
@@ -5199,7 +5248,9 @@ int config_parse_mount_images(
 
         if (isempty(rvalue)) {
                 /* Empty assignment resets the list */
-                c->mount_images = mount_image_free_many(c->mount_images, &c->n_mount_images);
+                mount_image_free_array(c->mount_images, c->n_mount_images);
+                c->mount_images = NULL;
+                c->n_mount_images = 0;
                 return 0;
         }
 
@@ -5269,7 +5320,6 @@ int config_parse_mount_images(
 
                 for (;;) {
                         _cleanup_free_ char *partition = NULL, *mount_options = NULL, *mount_options_resolved = NULL;
-                        MountOptions *o = NULL;
                         PartitionDesignator partition_designator;
 
                         r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options);
@@ -5289,14 +5339,9 @@ int config_parse_mount_images(
                                         continue;
                                 }
 
-                                o = new(MountOptions, 1);
-                                if (!o)
-                                        return log_oom();
-                                *o = (MountOptions) {
-                                        .partition_designator = PARTITION_ROOT,
-                                        .options = TAKE_PTR(mount_options_resolved),
-                                };
-                                LIST_APPEND(mount_options, options, o);
+                                r = mount_options_set_and_consume(&options, PARTITION_ROOT, TAKE_PTR(mount_options_resolved));
+                                if (r < 0)
+                                        return r;
 
                                 break;
                         }
@@ -5313,14 +5358,9 @@ int config_parse_mount_images(
                                 continue;
                         }
 
-                        o = new(MountOptions, 1);
-                        if (!o)
-                                return log_oom();
-                        *o = (MountOptions) {
-                                .partition_designator = partition_designator,
-                                .options = TAKE_PTR(mount_options_resolved),
-                        };
-                        LIST_APPEND(mount_options, options, o);
+                        r = mount_options_set_and_consume(&options, partition_designator, TAKE_PTR(mount_options_resolved));
+                        if (r < 0)
+                                return r;
                 }
 
                 r = mount_image_add(&c->mount_images, &c->n_mount_images,
@@ -5358,7 +5398,9 @@ int config_parse_extension_images(
 
         if (isempty(rvalue)) {
                 /* Empty assignment resets the list */
-                c->extension_images = mount_image_free_many(c->extension_images, &c->n_extension_images);
+                mount_image_free_array(c->extension_images, c->n_extension_images);
+                c->extension_images = NULL;
+                c->n_extension_images = 0;
                 return 0;
         }
 
@@ -5411,7 +5453,6 @@ int config_parse_extension_images(
 
                 for (;;) {
                         _cleanup_free_ char *partition = NULL, *mount_options = NULL, *mount_options_resolved = NULL;
-                        MountOptions *o = NULL;
                         PartitionDesignator partition_designator;
 
                         r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options);
@@ -5431,14 +5472,12 @@ int config_parse_extension_images(
                                         continue;
                                 }
 
-                                o = new(MountOptions, 1);
-                                if (!o)
-                                        return log_oom();
-                                *o = (MountOptions) {
-                                        .partition_designator = PARTITION_ROOT,
-                                        .options = TAKE_PTR(mount_options_resolved),
-                                };
-                                LIST_APPEND(mount_options, options, o);
+                                if (!options) {
+                                        options = new0(MountOptions, 1);
+                                        if (!options)
+                                                return log_oom();
+                                }
+                                free_and_replace(options->options[PARTITION_ROOT], mount_options_resolved);
 
                                 break;
                         }
@@ -5454,14 +5493,12 @@ int config_parse_extension_images(
                                 continue;
                         }
 
-                        o = new(MountOptions, 1);
-                        if (!o)
-                                return log_oom();
-                        *o = (MountOptions) {
-                                .partition_designator = partition_designator,
-                                .options = TAKE_PTR(mount_options_resolved),
-                        };
-                        LIST_APPEND(mount_options, options, o);
+                        if (!options) {
+                                options = new0(MountOptions, 1);
+                                if (!options)
+                                        return log_oom();
+                        }
+                        free_and_replace(options->options[partition_designator], mount_options_resolved);
                 }
 
                 r = mount_image_add(&c->extension_images, &c->n_extension_images,
@@ -5573,16 +5610,13 @@ int config_parse_emergency_action(
                 runtime_scope = ltype; /* otherwise, assume the scope is passed in via ltype */
 
         r = parse_emergency_action(rvalue, runtime_scope, x);
-        if (r < 0) {
-                if (r == -EOPNOTSUPP)
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "%s= specified as %s mode action, ignoring: %s",
-                                   lvalue, runtime_scope_to_string(runtime_scope), rvalue);
-                else
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse %s=, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
+        if (r == -EOPNOTSUPP)
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                                "%s= specified as %s mode action, ignoring: %s",
+                                lvalue, runtime_scope_to_string(runtime_scope), rvalue);
+        else if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                                "Failed to parse %s=, ignoring: %s", lvalue, rvalue);
 
         return 0;
 }
@@ -5997,6 +6031,47 @@ int config_parse_concurrency_max(
         }
 
         return config_parse_unsigned(unit, filename, line, section, section_line, lvalue, ltype, rvalue, data, userdata);
+}
+
+int config_parse_bind_network_interface(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        CGroupContext *c = ASSERT_PTR(data);
+
+        _cleanup_free_ char *k = NULL;
+        const Unit *u = ASSERT_PTR(userdata);
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                c->bind_network_interface = mfree(c->bind_network_interface);
+                return 0;
+        }
+
+        r = unit_full_printf(u, rvalue, &k);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to resolve unit specifiers in %s, ignoring: %m", rvalue);
+                return 0;
+        }
+
+        if (!ifname_valid_full(k, IFNAME_VALID_ALTERNATIVE)) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid interface name, ignoring: %s", k);
+                return 0;
+        }
+
+        return free_and_strdup_warn(&c->bind_network_interface, k);
 }
 
 static int merge_by_names(Unit *u, Set *names, const char *id) {
@@ -6634,7 +6709,7 @@ int config_parse_protect_hostname(
                         return 0;
                 }
 
-                if (!hostname_is_valid(h, /* flags = */ 0))
+                if (!hostname_is_valid(h, /* flags= */ 0))
                         return log_syntax(unit, LOG_WARNING, filename, line, 0,
                                           "Invalid hostname is specified to %s=, ignoring: %s", lvalue, h);
 

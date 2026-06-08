@@ -7,6 +7,8 @@
 #endif
 #include <stdio.h>
 
+#include "sd-dlopen.h"
+
 #include "ansi-color.h"
 #include "dlfcn-util.h"
 #include "locale-util.h"
@@ -20,24 +22,24 @@
 #define UNICODE_UPPER_HALF_BLOCK UTF8("▀")
 
 #if HAVE_QRENCODE
-static void *qrcode_dl = NULL;
-
 static DLSYM_PROTOTYPE(QRcode_encodeString) = NULL;
 static DLSYM_PROTOTYPE(QRcode_free) = NULL;
 #endif
 
-int dlopen_qrencode(void) {
+int dlopen_qrencode(int log_level) {
 #if HAVE_QRENCODE
+        static void *qrcode_dl = NULL;
         int r;
 
-        ELF_NOTE_DLOPEN("qrencode",
+        SD_ELF_NOTE_DLOPEN(
+                        "qrencode",
                         "Support for generating QR codes",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
                         "libqrencode.so.4", "libqrencode.so.3");
 
         FOREACH_STRING(s, "libqrencode.so.4", "libqrencode.so.3") {
                 r = dlopen_many_sym_or_warn(
-                        &qrcode_dl, s, LOG_DEBUG,
+                        &qrcode_dl, s, log_level,
                         DLSYM_ARG(QRcode_encodeString),
                         DLSYM_ARG(QRcode_free));
                 if (r >= 0)
@@ -46,7 +48,8 @@ int dlopen_qrencode(void) {
 
         return r;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libqrencode support is not compiled in.");
 #endif
 }
 
@@ -207,7 +210,7 @@ int print_qrcode_full(
         if (check_tty && !colors_enabled())
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Colors are disabled, cannot print qrcode");
 
-        r = dlopen_qrencode();
+        r = dlopen_qrencode(LOG_DEBUG);
         if (r < 0)
                 return r;
 

@@ -387,13 +387,16 @@ static int property_set_pretimeout_watchdog_governor(
                 sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
-        char *governor;
+        const char *governor;
         int r;
 
         r = sd_bus_message_read(value, "s", &governor);
         if (r < 0)
                 return r;
-        if (!string_is_safe(governor))
+
+        if (isempty(governor))
+                governor = NULL;
+        else if (!string_is_safe(governor, /* flags= */ 0))
                 return -EINVAL;
 
         return manager_override_watchdog_pretimeout_governor(m, governor);
@@ -652,6 +655,12 @@ static int method_get_unit_by_control_group(sd_bus_message *message, void *userd
         if (r < 0)
                 return r;
 
+        if (!path_is_absolute(cgroup))
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Control group path is not absolute: %s", cgroup);
+
+        if (!path_is_normalized(cgroup))
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Control group path is not normalized: %s", cgroup);
+
         u = manager_get_unit_by_cgroup(m, cgroup);
         if (!u)
                 return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_UNIT,
@@ -758,31 +767,31 @@ static int method_start_unit_generic(sd_bus_message *message, Manager *m, JobTyp
 }
 
 static int method_start_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_START, /* reload_if_possible = */ false, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_START, /* reload_if_possible= */ false, reterr_error);
 }
 
 static int method_stop_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_STOP, /* reload_if_possible = */ false, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_STOP, /* reload_if_possible= */ false, reterr_error);
 }
 
 static int method_reload_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_RELOAD, /* reload_if_possible = */ false, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_RELOAD, /* reload_if_possible= */ false, reterr_error);
 }
 
 static int method_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible = */ false, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible= */ false, reterr_error);
 }
 
 static int method_try_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible = */ false, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible= */ false, reterr_error);
 }
 
 static int method_reload_or_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible = */ true, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible= */ true, reterr_error);
 }
 
 static int method_reload_or_try_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible = */ true, reterr_error);
+        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible= */ true, reterr_error);
 }
 
 typedef enum GenericUnitOperationFlags {
@@ -857,19 +866,19 @@ static int method_start_unit_replace(sd_bus_message *message, void *userdata, sd
         if (!u->job || u->job->type != JOB_START)
                 return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_JOB, "No job queued for unit %s", old_name);
 
-        return method_start_unit_generic(message, m, JOB_START, /* reload_if_possible = */ false, reterr_error);
+        return method_start_unit_generic(message, m, JOB_START, /* reload_if_possible= */ false, reterr_error);
 }
 
 static int method_kill_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* We don't bother with GENERIC_UNIT_LOAD or GENERIC_UNIT_VALIDATE_LOADED here, as it shouldn't
          * matter whether a unit is loaded for killing any processes in the unit's cgroup. */
-        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_kill, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_kill, /* flags= */ 0);
 }
 
 static int method_kill_unit_subgroup(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* We don't bother with GENERIC_UNIT_LOAD or GENERIC_UNIT_VALIDATE_LOADED here, as it shouldn't
          * matter whether a unit is loaded for killing any processes in the unit's cgroup. */
-        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_kill_subgroup, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_kill_subgroup, /* flags= */ 0);
 }
 
 static int method_clean_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
@@ -891,7 +900,7 @@ static int method_thaw_unit(sd_bus_message *message, void *userdata, sd_bus_erro
 static int method_reset_failed_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Don't load the unit (because unloaded units can't be in failed state), and don't insist on the
          * unit to be loaded properly (since a failed unit might have its unit file disappeared) */
-        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_reset_failed, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_reset_failed, /* flags= */ 0);
 }
 
 static int method_set_unit_properties(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
@@ -917,7 +926,7 @@ static int method_ref_unit(sd_bus_message *message, void *userdata, sd_bus_error
 static int method_unref_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Dropping a ref OTOH should not require the unit to still be loaded. And since a reffed unit is a
          * loaded unit there's no need to load the unit for unreffing it. */
-        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_unref, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_unref, /* flags= */ 0);
 }
 
 static int reply_unit_info(sd_bus_message *reply, Unit *u) {
@@ -962,6 +971,10 @@ static int method_list_units_by_names(sd_bus_message *message, void *userdata, s
         if (r < 0)
                 return r;
 
+        if (strv_length(units) > MAX(hashmap_size(m->units), (unsigned) MANAGER_MAX_NAMES / 2))
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many unit names requested.");
+
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
                 return r;
@@ -996,7 +1009,7 @@ static int method_get_unit_processes(sd_bus_message *message, void *userdata, sd
         /* Don't load a unit actively (since it won't have any processes if it's not loaded), but don't
          * insist on the unit being loaded either (because even improperly loaded units might still have
          * processes around). */
-        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_get_processes, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_get_processes, /* flags= */ 0);
 }
 
 static int method_attach_processes_to_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
@@ -1019,7 +1032,6 @@ static int transient_unit_from_message(
                 Unit **ret_unit,
                 sd_bus_error *reterr_error) {
 
-        UnitType t;
         Unit *u;
         int r;
 
@@ -1027,27 +1039,7 @@ static int transient_unit_from_message(
         assert(message);
         assert(name);
 
-        t = unit_name_to_type(name);
-        if (t < 0)
-                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Invalid unit name or type: %s", name);
-
-        if (!unit_vtable[t]->can_transient)
-                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Unit type %s does not support transient units.",
-                                         unit_type_to_string(t));
-
-        r = manager_load_unit(m, name, NULL, reterr_error, &u);
-        if (r < 0)
-                return r;
-
-        if (!unit_is_pristine(u))
-                return sd_bus_error_setf(reterr_error, BUS_ERROR_UNIT_EXISTS,
-                                         "Unit %s was already loaded or has a fragment file.", name);
-
-        /* OK, the unit failed to load and is unreferenced, now let's
-         * fill in the transient data instead */
-        r = unit_make_transient(u);
+        r = manager_setup_transient_unit(m, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
@@ -1094,7 +1086,7 @@ static int transient_aux_units_from_message(
                 if (r < 0)
                         return r;
 
-                r = transient_unit_from_message(m, message, name, /* ret_unit = */ NULL, reterr_error);
+                r = transient_unit_from_message(m, message, name, /* ret_unit= */ NULL, reterr_error);
                 if (r < 0)
                         return r;
 
@@ -1259,9 +1251,13 @@ static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_e
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", reterr_error);
-        if (r < 0)
-                return r;
+        if (strv_length(states) > MANAGER_MAX_STATES_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many states in a single query.");
+
+        if (strv_length(patterns) > MANAGER_MAX_PATTERNS_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many patterns in a single query.");
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -1274,6 +1270,10 @@ static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_e
         HASHMAP_FOREACH_KEY(u, k, m->units) {
                 if (k != u->id)
                         continue;
+
+                r = mac_selinux_unit_access_check(u, message, "status", /* reterr_error= */ NULL);
+                if (r < 0)
+                        continue; /* silently skip units the caller is not allowed to see */
 
                 if (!unit_passes_filter(u, states, patterns))
                         continue;
@@ -1442,6 +1442,10 @@ static int dump_impl(
 
         assert(message);
 
+        if (strv_length(patterns) > MANAGER_MAX_PATTERNS_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many patterns in a single query.");
+
         /* 'status' access is the bare minimum always needed for this, as the policy might straight out
          * forbid a client from querying any information from systemd, regardless of any rate limiting. */
         r = mac_selinux_access_check(message, "status", reterr_error);
@@ -1457,11 +1461,11 @@ static int dump_impl(
                  * operations, and can cause PID1 to stall. So it seems similar enough in terms of security
                  * considerations and impact, and thus use the same access check for dumps which, given the
                  * large amount of data to fetch, can stall PID1 for quite some time. */
-                r = mac_selinux_access_check(message, "reload", /* error = */ NULL);
+                r = mac_selinux_access_check(message, "reload", /* error= */ NULL);
                 if (r < 0)
                         goto ratelimited;
 
-                r = bus_verify_bypass_dump_ratelimit_async(m, message, /* reterr_error = */ NULL);
+                r = bus_verify_bypass_dump_ratelimit_async(m, message, /* reterr_error= */ NULL);
                 if (r < 0)
                         goto ratelimited;
                 if (r == 0)
@@ -1537,17 +1541,20 @@ static int method_refuse_snapshot(sd_bus_message *message, void *userdata, sd_bu
 static void log_caller(sd_bus_message *message, Manager *manager, const char *method) {
         _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        int r;
 
         assert(message);
         assert(manager);
         assert(method);
 
-        if (sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID|SD_BUS_CREDS_PIDFD|SD_BUS_CREDS_AUGMENT, &creds) < 0)
-                return;
-
-        /* We need at least the PID, otherwise there's nothing to log, the rest is optional. */
-        if (bus_creds_get_pidref(creds, &pidref) < 0)
-                return;
+        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID|SD_BUS_CREDS_PIDFD|SD_BUS_CREDS_AUGMENT, &creds);
+        if (r < 0)
+                log_debug_errno(r, "Failed to get dbus sender creds, ignoring: %m");
+        else {
+                r = bus_creds_get_pidref(creds, &pidref);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to get peer pidref, ignoring: %m");
+        }
 
         manager_log_caller(manager, &pidref, method);
 }
@@ -1684,6 +1691,7 @@ static int method_soft_reboot(sd_bus_message *message, void *userdata, sd_bus_er
                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Soft reboot is only supported by system manager.");
 
+        /* Keep the checks in sync with varlink-manager.c:vl_method_soft_reboot_manager() */
         r = mac_selinux_access_check(message, "reboot", reterr_error);
         if (r < 0)
                 return r;
@@ -1884,6 +1892,10 @@ static int method_set_environment(sd_bus_message *message, void *userdata, sd_bu
         r = sd_bus_message_read_strv(message, &plus);
         if (r < 0)
                 return r;
+
+        if (strv_length(plus) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment assignments in a single query.");
         if (!strv_env_is_valid(plus))
                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
 
@@ -1915,6 +1927,9 @@ static int method_unset_environment(sd_bus_message *message, void *userdata, sd_
         if (r < 0)
                 return r;
 
+        if (strv_length(minus) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment variable names in a single query.");
         if (!strv_env_name_or_assignment_is_valid(minus))
                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Invalid environment variable names or assignments");
@@ -1951,6 +1966,9 @@ static int method_unset_and_set_environment(sd_bus_message *message, void *userd
         if (r < 0)
                 return r;
 
+        if (strv_length(plus) > ENVIRONMENT_ASSIGNMENTS_MAX || strv_length(minus) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment variable names or assignments in a single query.");
         if (!strv_env_name_or_assignment_is_valid(minus))
                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Invalid environment variable names or assignments");
@@ -2125,30 +2143,39 @@ static int method_enqueue_marked_jobs(sd_bus_message *message, void *userdata, s
         char *k;
         int ret = 0;
         HASHMAP_FOREACH_KEY(u, k, m->units) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+
                 /* ignore aliases */
                 if (u->id != k)
                         continue;
 
                 BusUnitQueueFlags flags;
-                if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RESTART))
+                JobType job;
+                if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RESTART)) {
                         flags = 0;
-                else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RELOAD))
+                        job = JOB_TRY_RESTART;
+                } else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RELOAD)) {
                         flags = BUS_UNIT_QUEUE_RELOAD_IF_POSSIBLE;
-                else
+                        job = JOB_TRY_RESTART;
+                } else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_STOP)) {
+                        flags = 0;
+                        job = JOB_STOP;
+                } else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_START)) {
+                        flags = 0;
+                        job = JOB_START;
+                } else
                         continue;
 
-                r = mac_selinux_unit_access_check(u, message, "start", reterr_error);
+                r = mac_selinux_unit_access_check(u, message, job_type_to_access_method(job), &error);
                 if (r >= 0)
                         r = bus_unit_queue_job_one(message, u,
-                                                   JOB_TRY_RESTART, JOB_FAIL, flags,
-                                                   reply, reterr_error);
+                                                   job, JOB_FAIL, flags,
+                                                   reply, &error);
                 if (ERRNO_IS_NEG_RESOURCE(r))
                         return r;
-                if (r < 0) {
-                        if (ret >= 0)
-                                ret = r;
-                        sd_bus_error_free(reterr_error);
-                }
+                if (r < 0)
+                        RET_GATHER(ret, log_unit_warning_errno(u, r, "Failed to enqueue marked job: %s",
+                                                               bus_error_message(&error, r)));
         }
 
         if (ret < 0)
@@ -2172,6 +2199,14 @@ static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, 
 
         /* Anyone can call this method */
 
+        if (strv_length(states) > MANAGER_MAX_STATES_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many states in a single query.");
+
+        if (strv_length(patterns) > MANAGER_MAX_PATTERNS_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many patterns in a single query.");
+
         r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
@@ -2180,7 +2215,7 @@ static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, 
         if (r < 0)
                 return r;
 
-        r = unit_file_get_list(m->runtime_scope, /* root_dir = */ NULL, states, patterns, &h);
+        r = unit_file_get_list(m->runtime_scope, /* root_dir= */ NULL, states, patterns, &h);
         if (r < 0)
                 return r;
 
@@ -2446,19 +2481,19 @@ static int method_enable_unit_files_generic(
 }
 
 static int method_enable_unit_files_with_flags(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info = */ true, reterr_error);
+        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info= */ true, reterr_error);
 }
 
 static int method_enable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info = */ true, reterr_error);
+        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info= */ true, reterr_error);
 }
 
 static int method_reenable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_reenable, /* carries_install_info = */ true, reterr_error);
+        return method_enable_unit_files_generic(message, userdata, unit_file_reenable, /* carries_install_info= */ true, reterr_error);
 }
 
 static int method_link_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_link, /* carries_install_info = */ false, reterr_error);
+        return method_enable_unit_files_generic(message, userdata, unit_file_link, /* carries_install_info= */ false, reterr_error);
 }
 
 static int unit_file_preset_without_mode(RuntimeScope scope, UnitFileFlags flags, const char *root_dir, char * const *files, InstallChange **changes, size_t *n_changes) {
@@ -2466,11 +2501,11 @@ static int unit_file_preset_without_mode(RuntimeScope scope, UnitFileFlags flags
 }
 
 static int method_preset_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_preset_without_mode, /* carries_install_info = */ true, reterr_error);
+        return method_enable_unit_files_generic(message, userdata, unit_file_preset_without_mode, /* carries_install_info= */ true, reterr_error);
 }
 
 static int method_mask_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_mask, /* carries_install_info = */ false, reterr_error);
+        return method_enable_unit_files_generic(message, userdata, unit_file_mask, /* carries_install_info= */ false, reterr_error);
 }
 
 static int method_preset_unit_files_with_mode(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
@@ -2573,19 +2608,19 @@ static int method_disable_unit_files_generic(
 }
 
 static int method_disable_unit_files_with_flags(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info = */ false, reterr_error);
+        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info= */ false, reterr_error);
 }
 
 static int method_disable_unit_files_with_flags_and_install_info(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info = */ true, reterr_error);
+        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info= */ true, reterr_error);
 }
 
 static int method_disable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info = */ false, reterr_error);
+        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info= */ false, reterr_error);
 }
 
 static int method_unmask_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_unmask, /* carries_install_info = */ false, reterr_error);
+        return method_disable_unit_files_generic(message, userdata, unit_file_unmask, /* carries_install_info= */ false, reterr_error);
 }
 
 static int method_revert_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
@@ -2924,6 +2959,8 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_PROPERTY("DefaultStartLimitIntervalSec", "t", bus_property_get_usec, offsetof(Manager, defaults.start_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
         SD_BUS_PROPERTY("DefaultStartLimitInterval", "t", bus_property_get_usec, offsetof(Manager, defaults.start_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
         SD_BUS_PROPERTY("DefaultStartLimitBurst", "u", bus_property_get_unsigned, offsetof(Manager, defaults.start_limit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("EventLoopRateLimitIntervalUSec", "t", bus_property_get_usec, offsetof(Manager, event_loop_ratelimit.interval), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("EventLoopRateLimitBurst", "u", bus_property_get_unsigned, offsetof(Manager, event_loop_ratelimit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultIOAccounting", "b", bus_property_get_bool, offsetof(Manager, defaults.io_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultIPAccounting", "b", bus_property_get_bool, offsetof(Manager, defaults.ip_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultMemoryAccounting", "b", bus_property_get_bool, offsetof(Manager, defaults.memory_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -2961,14 +2998,20 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_PROPERTY("DefaultLimitRTTIME", "t", bus_property_get_rlimit, offsetof(Manager, defaults.rlimit[RLIMIT_RTTIME]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultLimitRTTIMESoft", "t", bus_property_get_rlimit, offsetof(Manager, defaults.rlimit[RLIMIT_RTTIME]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultTasksMax", "t", bus_property_get_tasks_max, offsetof(Manager, defaults.tasks_max), 0),
-        SD_BUS_PROPERTY("DefaultMemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.memory_pressure_threshold_usec), 0),
-        SD_BUS_PROPERTY("DefaultMemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.memory_pressure_watch), 0),
+        SD_BUS_PROPERTY("DefaultMemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.pressure[PRESSURE_MEMORY].threshold_usec), 0),
+        SD_BUS_PROPERTY("DefaultMemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.pressure[PRESSURE_MEMORY].watch), 0),
+        SD_BUS_PROPERTY("DefaultCPUPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.pressure[PRESSURE_CPU].threshold_usec), 0),
+        SD_BUS_PROPERTY("DefaultCPUPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.pressure[PRESSURE_CPU].watch), 0),
+        SD_BUS_PROPERTY("DefaultIOPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.pressure[PRESSURE_IO].threshold_usec), 0),
+        SD_BUS_PROPERTY("DefaultIOPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.pressure[PRESSURE_IO].watch), 0),
         SD_BUS_PROPERTY("TimerSlackNSec", "t", property_get_timer_slack_nsec, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultOOMPolicy", "s", bus_property_get_oom_policy, offsetof(Manager, defaults.oom_policy), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultOOMScoreAdjust", "i", property_get_oom_score_adjust, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultRestrictSUIDSGID", "b", bus_property_get_bool, offsetof(Manager, defaults.restrict_suid_sgid), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("CtrlAltDelBurstAction", "s", bus_property_get_emergency_action, offsetof(Manager, cad_burst_action), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SoftRebootsCount", "u", bus_property_get_unsigned, offsetof(Manager, soft_reboots_count), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("ReloadCount", "t", NULL, offsetof(Manager, reload_count), 0),
+        SD_BUS_PROPERTY("DefaultMemoryZSwapWriteback", "b", bus_property_get_bool, offsetof(Manager, defaults.memory_zswap_writeback), SD_BUS_VTABLE_PROPERTY_CONST),
 
         /* deprecated cgroup v1 property */
         SD_BUS_PROPERTY("DefaultBlockIOAccounting", "b", bus_property_get_bool_false, 0, SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_DEPRECATED|SD_BUS_VTABLE_HIDDEN),

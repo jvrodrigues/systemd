@@ -6,13 +6,18 @@
 #include "sd-varlink.h"
 
 #include "bootctl-reboot-to-firmware.h"
+#include "bootctl-util.h"
 #include "efi-api.h"
 #include "errno-util.h"
 #include "log.h"
 #include "parse-util.h"
 
-int verb_reboot_to_firmware(int argc, char *argv[], void *userdata) {
+int verb_reboot_to_firmware(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
+
+        r = verify_touch_variables_allowed(argv[0]);
+        if (r < 0)
+                return r;
 
         if (argc < 2) {
                 r = efi_get_reboot_to_firmware();
@@ -68,7 +73,7 @@ int vl_method_set_reboot_to_firmware(sd_varlink *link, sd_json_variant *paramete
 int vl_method_get_reboot_to_firmware(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         int r;
 
-        r = sd_varlink_dispatch(link, parameters, /* dispatch_table = */ NULL, /* userdata = */ NULL);
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
                 return r;
 

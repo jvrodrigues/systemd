@@ -5,8 +5,10 @@ if get_option('libc') != 'musl'
 endif
 
 libc_wrapper_sources += files(
+        'crypt.c',
         'printf.c',
         'stdio.c',
         'stdlib.c',
         'string.c',
+        'unistd.c',
 )

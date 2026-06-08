@@ -30,14 +30,12 @@ common_dependencies = [
         liblz4_cflags,
         libxz_cflags,
         libzstd_cflags,
-        threads,
 ]
 
 executables += [
         libexec_template + {
                 'name' : 'systemd-coredump',
                 'sources' : systemd_coredump_sources,
-                'include_directories' : [libexec_template['include_directories'], include_directories('.')],
                 'extract' : systemd_coredump_extract_sources,
                 'link_with' : [libshared],
                 'dependencies' : common_dependencies,

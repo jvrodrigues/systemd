@@ -248,11 +248,11 @@ int efi_set_variable(const char *variable, const void *value, size_t size) {
          * accidentally however, hence let's unset the bit first. */
 
         r = chattr_full(AT_FDCWD, p,
-                        /* value = */ 0,
-                        /* mask = */ FS_IMMUTABLE_FL,
-                        /* ret_previous = */ &saved_flags,
-                        /* ret_final = */ NULL,
-                        /* flags = */ 0);
+                        /* value= */ 0,
+                        /* mask= */ FS_IMMUTABLE_FL,
+                        /* ret_previous= */ &saved_flags,
+                        /* ret_final= */ NULL,
+                        /* flags= */ 0);
         if (r < 0 && r != -ENOENT)
                 log_debug_errno(r, "Failed to drop FS_IMMUTABLE_FL flag from '%s', ignoring: %m", p);
 
@@ -288,7 +288,7 @@ int efi_set_variable(const char *variable, const void *value, size_t size) {
 
         /* For some reason efivarfs doesn't update mtime automatically. Let's do it manually then. This is
          * useful for processes that cache EFI variables to detect when changes occurred. */
-        if (futimens(fd, /* times = */ NULL) < 0)
+        if (futimens(fd, /* times= */ NULL) < 0)
                 log_debug_errno(errno, "Failed to update mtime/atime on %s, ignoring: %m", p);
 
         r = 0;
@@ -319,20 +319,26 @@ int efi_set_variable_string(const char *variable, const char *value) {
         return efi_set_variable(variable, u16, (char16_strlen(u16) + 1) * sizeof(char16_t));
 }
 
-bool is_efi_boot(void) {
-        static int cache = -1;
+static int cache_efi_boot = -1;
 
-        if (cache < 0) {
-                if (detect_container() > 0)
-                        cache = false;
-                else {
-                        cache = access("/sys/firmware/efi/", F_OK) >= 0;
-                        if (!cache && errno != ENOENT)
-                                log_debug_errno(errno, "Unable to test whether /sys/firmware/efi/ exists, assuming EFI not available: %m");
-                }
+bool set_efi_boot(bool b) {
+        return (cache_efi_boot = b);
+}
+
+bool is_efi_boot(void) {
+        if (cache_efi_boot >= 0)
+                return cache_efi_boot;
+
+        if (detect_container() > 0)
+                return (cache_efi_boot = false);
+
+        if (access("/sys/firmware/efi/", F_OK) < 0) {
+                if (errno != ENOENT)
+                        log_debug_errno(errno, "Unable to test whether /sys/firmware/efi/ exists, assuming EFI not available: %m");
+                return (cache_efi_boot = false);
         }
 
-        return cache;
+        return (cache_efi_boot = true);
 }
 
 static int read_flag(const char *variable) {

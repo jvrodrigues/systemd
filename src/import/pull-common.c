@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-id128.h"
 
 #include "alloc-util.h"
@@ -8,10 +10,12 @@
 #include "fd-util.h"
 #include "hexdecoct.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "memory-util.h"
 #include "os-util.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "pull-common.h"
 #include "pull-job.h"
@@ -404,7 +408,7 @@ static int verify_gpg(
         _cleanup_close_pair_ int gpg_pipe[2] = EBADF_PAIR;
         _cleanup_(rm_rf_physical_and_freep) char *gpg_home = NULL;
         char sig_file_path[] = "/tmp/sigXXXXXX";
-        _cleanup_(sigkill_waitp) pid_t pid = 0;
+        _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
         int r;
 
         assert(iovec_is_valid(payload));
@@ -434,11 +438,12 @@ static int verify_gpg(
                 goto finish;
         }
 
-        r = safe_fork_full("(gpg)",
-                           (int[]) { gpg_pipe[0], -EBADF, STDERR_FILENO },
-                           NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
-                           &pid);
+        r = pidref_safe_fork_full(
+                        "(gpg)",
+                        (int[]) { gpg_pipe[0], -EBADF, STDERR_FILENO },
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        &pidref);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -450,7 +455,7 @@ static int verify_gpg(
                         "--no-auto-check-trustdb",
                         "--batch",
                         "--trust-model=always",
-                        NULL, /* --homedir=  */
+                        NULL, /* --homedir= */
                         NULL, /* --keyring= */
                         NULL, /* --verify */
                         NULL, /* signature file */
@@ -497,9 +502,10 @@ static int verify_gpg(
 
         gpg_pipe[1] = safe_close(gpg_pipe[1]);
 
-        r = wait_for_terminate_and_check("gpg", TAKE_PID(pid), WAIT_LOG_ABNORMAL);
+        r = pidref_wait_for_terminate_and_check("gpg", &pidref, WAIT_LOG_ABNORMAL);
         if (r < 0)
                 goto finish;
+        pidref_done(&pidref);
         if (r != EXIT_SUCCESS)
                 r = log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                     "DOWNLOAD INVALID: Signature verification failed.");
@@ -525,7 +531,6 @@ int pull_verify(ImportVerify verify,
                 PullJob *verity_job) {
 
         _cleanup_free_ char *fn = NULL;
-        VerificationStyle style;
         PullJob *verify_job;
         int r;
 
@@ -573,11 +578,6 @@ int pull_verify(ImportVerify verify,
                 return 0;
 
         assert(verify_job);
-
-        r = verification_style_from_url(verify_job->url, &style);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine verification style from URL '%s': %m", verify_job->url);
-
         assert(signature_job);
         assert(signature_job->state == PULL_JOB_DONE);
 
@@ -619,6 +619,7 @@ int pull_job_restart_with_sha256sum(PullJob *j, char **ret) {
         int r;
 
         assert(j);
+        assert(ret);
 
         /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting SHA256SUMS */
 
@@ -672,6 +673,7 @@ int pull_job_restart_with_signature(PullJob *j, char **ret) {
         int r;
 
         assert(j);
+        assert(ret);
 
         /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting a different
          * signature file. After the initial file, additional *.sha256.gpg, SHA256SUMS.gpg and SHA256SUMS.asc

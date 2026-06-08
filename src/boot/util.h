@@ -2,7 +2,7 @@
 #pragma once
 
 #include "efi.h"
-#include "memory-util-fundamental.h"
+#include "memory-util.h"
 
 #if SD_BOOT
 
@@ -96,6 +96,13 @@ static inline Pages xmalloc_pages(
         };
 }
 
+Pages xmalloc_aligned_pages(
+                EFI_ALLOCATE_TYPE type,
+                EFI_MEMORY_TYPE memory_type,
+                size_t n_pages,
+                size_t alignment,
+                EFI_PHYSICAL_ADDRESS addr);
+
 static inline Pages xmalloc_initrd_pages(size_t n_pages) {
         /* The original native x86 boot protocol of the Linux kernel was not 64bit safe, hence we try to
          * allocate memory for the initrds below the 4G boundary on x86, since we don't know early enough
@@ -131,6 +138,7 @@ char16_t *mangle_stub_cmdline(char16_t *cmdline);
 
 EFI_STATUS chunked_read(EFI_FILE *file, size_t *size, void *buf);
 EFI_STATUS file_read(EFI_FILE *dir, const char16_t *name, uint64_t offset, size_t size, char **ret, size_t *ret_size);
+EFI_STATUS load_file_from_simple_filesystem(const EFI_DEVICE_PATH *device_path, char **file_buffer, size_t *file_size);
 EFI_STATUS file_handle_read(EFI_FILE *handle, uint64_t offset, size_t size, char **ret, size_t *ret_size);
 
 static inline void file_closep(EFI_FILE **handle) {

@@ -137,7 +137,7 @@ int sd_ndisc_attach_event(sd_ndisc *nd, sd_event *event, int64_t priority) {
         else {
                 r = sd_event_default(&nd->event);
                 if (r < 0)
-                        return 0;
+                        return r;
         }
 
         nd->event_priority = priority;
@@ -348,6 +348,12 @@ static int ndisc_recv(sd_event_source *s, int fd, uint32_t revents, void *userda
                 return 0;
         }
 
+        if (packet->ifindex != nd->ifindex) {
+                log_ndisc(nd, "Received an ICMPv6 packet on interface %i, expected %i, ignoring.",
+                          packet->ifindex, nd->ifindex);
+                return 0;
+        }
+
         /* The function icmp6_receive() accepts the null source address, but RFC 4861 Section 6.1.2 states
          * that hosts MUST discard messages with the null source address. */
         if (in6_addr_is_null(&packet->sender_address)) {
@@ -487,7 +493,7 @@ static int ndisc_setup_recv_event(sd_ndisc *nd) {
         assert(nd->ifindex > 0);
 
         _cleanup_close_ int fd = -EBADF;
-        fd = icmp6_bind(nd->ifindex, /* is_router = */ false);
+        fd = icmp6_bind(nd->ifindex, /* is_router= */ false);
         if (fd < 0)
                 return fd;
 

@@ -34,7 +34,7 @@ static int acquire_image_policy(ImagePolicy **ret) {
                 return 0;
         }
 
-        r = image_policy_from_string(value, ret);
+        r = image_policy_from_string(value, /* graceful= */ false, ret);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse image policy '%s': %m", value);
 
@@ -192,7 +192,7 @@ static int verb_probe(UdevEvent *event, sd_device *dev) {
                                 (void) image_policy_to_string(image_policy, /* simplify= */ false, &a);
                                 (void) image_policy_to_string(image_policy_mangled, /* simplify= */ false, &b);
 
-                                log_device_debug_errno(dev, ERFKILL, "Couldn't dissect block device with regular policy '%s', retrying with policy where root/usr are set to ignore '%s'.", a, b);
+                                log_device_debug_errno(dev, SYNTHETIC_ERRNO(ERFKILL), "Couldn't dissect block device with regular policy '%s', retrying with policy where root/usr are set to ignore '%s'.", a, b);
                         }
 
                         r = dissect_loop_device(

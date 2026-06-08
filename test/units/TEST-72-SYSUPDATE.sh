@@ -5,7 +5,7 @@
 set -eux
 set -o pipefail
 
-SYSUPDATE=/lib/systemd/systemd-sysupdate
+SYSUPDATE=/usr/bin/systemd-sysupdate
 SYSUPDATED=/lib/systemd/systemd-sysupdated
 SECTOR_SIZES=(512 4096)
 WORKDIR="$(mktemp -d /var/tmp/test-72-XXXXXX)"
@@ -20,6 +20,8 @@ if [[ ! -x "$SYSUPDATE" ]]; then
     echo "no systemd-sysupdate" >/skipped
     exit 77
 fi
+
+have_updatectl=$([[ -x "$SYSUPDATED" ]] && command -v updatectl)
 
 # Loopback devices may not be supported. They are used because sfdisk cannot
 # change the sector size of a file, and we want to test both 512 and 4096 byte
@@ -54,12 +56,17 @@ at_exit() {
 trap at_exit EXIT
 
 update_checksums() {
-    (cd "$WORKDIR/source" && sha256sum uki* part* dir-*.tar.gz >SHA256SUMS)
+    (cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && sha256sum uki* part* dir-*.tar.gz linux* >SHA256SUMS)
+}
+
+update_checksums_with_best_before() {
+    (cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && touch "BEST-BEFORE-$1" && sha256sum uki* part* dir-*.tar.gz linux* "BEST-BEFORE-$1" >SHA256SUMS)
 }
 
 new_version() {
     local sector_size="${1:?}"
     local version="${2:?}"
+    local corrupt="${3:-}"
 
     # Create a pair of random partition payloads, and compress one.
     # To make not the initial bytes of part1-xxx.raw accidentally match one of the compression header,
@@ -68,6 +75,10 @@ new_version() {
     dd if=/dev/urandom of="$WORKDIR/source/part1-$version.raw" bs="$sector_size" count=2047 conv=notrunc oflag=append
     dd if=/dev/urandom of="$WORKDIR/source/part2-$version.raw" bs="$sector_size" count=2048
     gzip -k -f "$WORKDIR/source/part2-$version.raw"
+
+    # Create a file payload and a suffixed version
+    echo $RANDOM >"$WORKDIR/source/linux-$version.erofs"
+    echo $RANDOM >"$WORKDIR/source/linux-$version.erofs.caibx"
 
     # Create a random "UKI" payload
     echo $RANDOM >"$WORKDIR/source/uki-$version.efi"
@@ -84,16 +95,65 @@ new_version() {
     echo $RANDOM >"$WORKDIR/source/dir-$version/bar.txt"
     tar --numeric-owner -C "$WORKDIR/source/dir-$version/" -czf "$WORKDIR/source/dir-$version.tar.gz" .
 
-    update_checksums
+    if [[ "$corrupt" == "corrupt-checksum" ]]; then
+        # As requested, add a deliberately corrupt checksum for this file. This
+        # will get overwritten next time update_checksums() is called, but the
+        # integration test will probably have moved on to other things by then.
+        {
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  part1-$version.raw"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  part2-$version.raw"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  part2-$version.raw.gz"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  linux-$version.erofs"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  linux-$version.erofs.caibx"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  uki-$version.efi"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  uki-extra-$version.efi"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  dir-$version.tar.gz"
+        } >> "$WORKDIR/source/SHA256SUMS"
+    else
+        update_checksums
+    fi
 }
 
 update_now() {
+    local update_type="${1:?}"
+    local checks="${2:-}"
+
     # Update to newest version. First there should be an update ready, then we
     # do the update, and then there should not be any ready anymore
+    #
+    # The update can either be done monolithically (by calling the `update`
+    # verb) or split (`acquire` then `update`). Both options are allowed for
+    # most updates in the test suite, so the test suite can be run to test both
+    # modes. Some updates in the test suite need to be monolithic (e.g. when
+    # repairing an installation), so that can be overridden via the local.
 
-    "$SYSUPDATE" --verify=no check-new
-    "$SYSUPDATE" --verify=no update
-    (! "$SYSUPDATE" --verify=no check-new)
+    if [[ "$checks" != "no-checks" ]]; then
+        "$SYSUPDATE" --verify=no check-new
+    fi
+
+    if [[ "$update_type" == "monolithic" ]]; then
+        "$SYSUPDATE" --verify=no update
+    elif [[ "$update_type" == "split-offline" ]]; then
+        "$SYSUPDATE" --verify=no acquire
+        "$SYSUPDATE" --verify=no update --offline
+    elif [[ "$update_type" == "split" ]]; then
+        "$SYSUPDATE" --verify=no acquire
+        "$SYSUPDATE" --verify=no update
+    elif [[ "$update_type" == "updatectl" ]]; then
+        if $have_updatectl; then
+            systemctl start systemd-sysupdated
+            updatectl update
+        else
+            # Gracefully fall back to sysupdate
+            "$SYSUPDATE" --verify=no update
+        fi
+    else
+        exit 1
+    fi
+
+    if [[ "$checks" != "no-checks" ]]; then
+        (! "$SYSUPDATE" --verify=no check-new)
+    fi
 }
 
 verify_version() {
@@ -118,6 +178,10 @@ verify_version() {
 
     # Check the extra efi
     cmp "$WORKDIR/source/uki-extra-$version.efi" "$WORKDIR/xbootldr/EFI/Linux/uki_$version.efi.extra.d/extra.addon.efi"
+
+    # Check the regular file and its suffixed version
+    cmp "$WORKDIR/source/linux-$version.erofs" "$WORKDIR/system/linux-$version.erofs"
+    cmp "$WORKDIR/source/linux-$version.erofs.caibx" "$WORKDIR/system/linux-$version.erofs.caibx"
 }
 
 verify_version_current() {
@@ -130,7 +194,14 @@ verify_version_current() {
     cmp "$WORKDIR/source/dir-$version/bar.txt" "$WORKDIR/dirs/current/bar.txt"
 }
 
+verify_object_fields() {
+    local updatectl_output="${1:?}"
+
+    [[ "${updatectl_output}" != *"Unrecognized object field"* ]] || exit 1
+}
+
 for sector_size in "${SECTOR_SIZES[@]}"; do
+for update_type in monolithic split-offline split updatectl; do
     # Disk size of:
     # - 1MB for GPT
     # - 4 partitions of 2048 sectors each
@@ -183,7 +254,7 @@ MatchPattern=part2-@v.raw.gz
 [Target]
 Type=partition
 Path=$blockdev
-MatchPattern=part2-@v
+MatchPattern=a-very-long-partition-name-@v
 MatchPartitionType=root-x86-64-verity
 EOF
 
@@ -235,6 +306,36 @@ Mode=0444
 InstancesMax=2
 EOF
 
+    # Test with a transfer which contains one of the other transfers as a prefix
+    # of its files, to check pattern matching can distinguish the two.
+    cat >"$CONFIGDIR/06-sixth.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=linux-@v.erofs
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/system
+MatchPattern=linux-@v.erofs
+ReadOnly=yes
+InstancesMax=4
+EOF
+
+    cat >"$CONFIGDIR/07-seventh.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=linux-@v.erofs.caibx
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/system
+MatchPattern=linux-@v.erofs.caibx
+ReadOnly=yes
+InstancesMax=4
+EOF
+
     cat >"$CONFIGDIR/optional.feature" <<EOF
 [Feature]
 Description=Optional Feature
@@ -258,23 +359,23 @@ Mode=0444
 InstancesMax=2
 EOF
 
-    rm -rf "${WORKDIR:?}"/{esp,xbootldr,source}
-    mkdir -p "$WORKDIR"/{source,esp/EFI/Linux,xbootldr/EFI/Linux}
+    rm -rf "${WORKDIR:?}"/{esp,xbootldr,source,system}
+    mkdir -p "$WORKDIR"/{source,esp/EFI/Linux,xbootldr/EFI/Linux,system}
 
     # Install initial version and verify
     new_version "$sector_size" v1
-    update_now
+    update_now "$update_type"
     verify_version_current "$blockdev" "$sector_size" v1 1
 
     # Create second version, update and verify that it is added
     new_version "$sector_size" v2
-    update_now
+    update_now "$update_type"
     verify_version "$blockdev" "$sector_size" v1 1
     verify_version_current "$blockdev" "$sector_size" v2 2
 
     # Create third version, update and verify it replaced the first version
     new_version "$sector_size" v3
-    update_now
+    update_now "$update_type"
     verify_version_current "$blockdev" "$sector_size" v3 1
     verify_version "$blockdev" "$sector_size" v2 2
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v1+3-0.efi"
@@ -291,17 +392,18 @@ EOF
     # Create a fifth version, that's complete on the server side. We should
     # completely skip the incomplete v4 and install v5 instead.
     new_version "$sector_size" v5
-    update_now
+    update_now "$update_type"
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
 
     # Make the local installation of v5 incomplete by deleting a file, then make
     # sure that sysupdate still recognizes the installation and can complete it
     # in place
+    # Always do this as a monolithic update for the repair to work.
     rm -r "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d"
-    "$SYSUPDATE" --offline list v5 | grep -q "incomplete"
-    update_now
-    "$SYSUPDATE" --offline list v5 | grep -qv "incomplete"
+    "$SYSUPDATE" --offline list v5 | grep "incomplete" >/dev/null
+    update_now "monolithic"
+    "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
 
@@ -311,9 +413,9 @@ EOF
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d/optional.efi"
     mkdir "$CONFIGDIR/optional.feature.d"
     echo -e "[Feature]\nEnabled=true" > "$CONFIGDIR/optional.feature.d/enable.conf"
-    "$SYSUPDATE" --offline list v5 | grep -q "incomplete"
-    update_now
-    "$SYSUPDATE" --offline list v5 | grep -qv "incomplete"
+    "$SYSUPDATE" --offline list v5 | grep "incomplete" >/dev/null
+    update_now "$update_type"
+    "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
     test -f "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d/optional.efi"
@@ -322,7 +424,7 @@ EOF
     rm -r "$CONFIGDIR/optional.feature.d"
     (! "$SYSUPDATE" --verify=no check-new)
     "$SYSUPDATE" vacuum
-    "$SYSUPDATE" --offline list v5 | grep -qv "incomplete"
+    "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d/optional.efi"
@@ -330,13 +432,15 @@ EOF
     # Create sixth version, update using updatectl and verify it replaced the
     # correct version
     new_version "$sector_size" v6
-    if [[ -x "$SYSUPDATED" ]] && command -v updatectl; then
+    if $have_updatectl; then
         systemctl start systemd-sysupdated
         "$SYSUPDATE" --verify=no check-new
-        updatectl update
+        updatectl update |& tee "$WORKDIR"/updatectl-update-6
+        grep "Done" "$WORKDIR"/updatectl-update-6
+        (! grep "Already up-to-date" "$WORKDIR"/updatectl-update-6)
     else
         # If no updatectl, gracefully fall back to systemd-sysupdate
-        update_now
+        update_now "$update_type"
     fi
     # User-facing updatectl returns 0 if there's no updates, so use the low-level
     # utility to make sure we did upgrade
@@ -348,12 +452,12 @@ EOF
     # testing for specific output, but this will at least catch obvious crashes
     # and allow updatectl to run under the various sanitizers. We create a
     # component so that updatectl has multiple targets to list.
-    if [[ -x "$SYSUPDATED" ]] && command -v updatectl; then
+    if $have_updatectl; then
         mkdir -p /run/sysupdate.test.d/
         cp "$CONFIGDIR/01-first.transfer" /run/sysupdate.test.d/01-first.transfer
-        updatectl list
-        updatectl list host
-        updatectl list host@v6
+        verify_object_fields "$(updatectl list 2>&1)"
+        verify_object_fields "$(updatectl list host 2>&1)"
+        verify_object_fields "$(updatectl list host@v6 2>&1)"
         updatectl check
         rm -r /run/sysupdate.test.d
     fi
@@ -375,7 +479,7 @@ MatchPattern=part2-@v.raw.gz
 [Target]
 Type=partition
 Path=$blockdev
-MatchPattern=part2-@v
+MatchPattern=a-very-long-partition-name-@v
 MatchPartitionType=root-x86-64-verity
 EOF
 
@@ -393,21 +497,112 @@ MatchPattern=dir-@v
 InstancesMax=3
 EOF
 
-    update_now
+    update_now "$update_type"
     verify_version "$blockdev" "$sector_size" v6 1
     verify_version_current "$blockdev" "$sector_size" v7 2
+
+    # Check with a best before in the past
+    update_checksums_with_best_before "$(date -u +'%Y-%m-%d' -d 'last month')"
+    (! "$SYSUPDATE" --verify=no update)
+
+    # Retry but force check off
+    SYSTEMD_SYSUPDATE_VERIFY_FRESHNESS=0 "$SYSUPDATE" --verify=no update
+
+    # Check with best before in the future
+    update_checksums_with_best_before "$(date -u +'%Y-%m-%d' -d 'next month')"
+    "$SYSUPDATE" --verify=no update
+
+    # Check again without a best before
+    update_checksums
+    "$SYSUPDATE" --verify=no update
 
     # Let's make sure that we don't break our backwards-compat for .conf files
     # (what .transfer files were called before v257)
     for i in "$CONFIGDIR/"*.conf; do echo mv "$i" "${i%.conf}.transfer"; done
     new_version "$sector_size" v8
-    update_now
+    update_now "$update_type"
     verify_version_current "$blockdev" "$sector_size" v8 1
     verify_version "$blockdev" "$sector_size" v7 2
+
+    # Create a 9th version but corrupt the checksum in SHA256SUMS so pulling it
+    # fails when verifying the checksum, in order to create a current+partial
+    # state. Try to update again and verify that this results in an error.
+    # Vacuum the partial version, regenerate it on the server, try updating
+    # again and it should succeed.
+    new_version "$sector_size" v9 "corrupt-checksum"
+    (! update_now "$update_type")
+    "$SYSUPDATE" --offline list v9 | grep "partial" >/dev/null
+    verify_version_current "$blockdev" "$sector_size" v8 1
+    # don’t verify the other part of the block device as it’s in an indeterminate state
+    (! update_now "$update_type" "no-checks") |& tee "$WORKDIR"/update_now-9
+    cat "$WORKDIR"/update_now-9
+    grep "is already acquired and partially installed. Vacuum it to try installing again." "$WORKDIR"/update_now-9
+    "$SYSUPDATE" --offline vacuum |& grep "Removing old partial" >/dev/null
+    verify_version_current "$blockdev" "$sector_size" v8 1
+    # don’t verify the other part of the block device as it’s in an indeterminate state
+    "$SYSUPDATE" --verify=no list v9 | grep "candidate" >/dev/null
+    new_version "$sector_size" v9
+    update_now "$update_type"
+    verify_version "$blockdev" "$sector_size" v8 1
+    verify_version_current "$blockdev" "$sector_size" v9 2
 
     # Cleanup
     [[ -b "$blockdev" ]] && losetup --detach "$blockdev"
     rm "$BACKING_FILE"
 done
+done
+
+# Regression test for https://github.com/systemd/systemd/issues/41501 — check
+# that a ‘default’ component is only listed by sysupdate if it’s fully configured
+mv "$CONFIGDIR" "$CONFIGDIR.backup"
+mkdir -p /run/sysupdate.some-component.d
+tee /run/sysupdate.some-component.d/portable.transfer << EOF
+[Transfer]
+ChangeLog=https://example.com/changelog/@v
+Verify=no
+
+[Source]
+Type=url-tar
+Path=https://example.com/does-not-matter/@v.tar.xz
+MatchPattern=some-component_@v-portable.tar.xz
+
+[Target]
+Type=directory
+Path=/var/lib/portables
+MatchPattern=some-component_@v
+CurrentSymlink=some-component
+EOF
+"$SYSUPDATE" --json=short components | grep -F '{"default":false,"components":["some-component"]}' >/dev/null
+mkdir /run/sysupdate.d
+"$SYSUPDATE" --json=short components | grep -F '{"default":false,"components":["some-component"]}' >/dev/null
+
+# Clean up regression test
+rmdir /run/sysupdate.d
+rm -rf /run/sysupdate.some-component.d
+mv "$CONFIGDIR.backup" "$CONFIGDIR"
+
+# Make sure the processing of compressed streams still handles uncompressed streams shorter than
+# COMPRESSION_MAGIC_BYTES_MAX correctly.
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"
+printf 'xx' >"$WORKDIR/source/tiny-v1.bin"
+(cd "$WORKDIR/source" && sha256sum tiny-v1.bin >SHA256SUMS)
+cat >"$CONFIGDIR/01-tiny-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=tiny-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=tiny-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/tiny-v1.bin" "$WORKDIR/blobs/tiny-v1.bin"
+rm "$CONFIGDIR/01-tiny-url.transfer"
+rm "$WORKDIR/source/tiny-v1.bin"
+rm "$WORKDIR/source/SHA256SUMS"
 
 touch /testok

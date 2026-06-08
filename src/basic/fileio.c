@@ -7,13 +7,16 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "chase.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
-#include "label.h"
+#include "io-util.h"
+#include "iovec-util.h"
+#include "label-util.h"
 #include "log.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
@@ -417,15 +420,29 @@ int read_one_line_file_at(int dir_fd, const char *filename, char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(filename);
         assert(ret);
 
-        r = fopen_unlocked_at(dir_fd, filename, "re", 0, &f);
+        r = fopen_unlocked_at(dir_fd, filename, "re", /* open_flags= */ 0, &f);
         if (r < 0)
                 return r;
 
         return read_line(f, LONG_LINE_MAX, ret);
+}
+
+int read_boolean_file_at(int dir_fd, const char *filename) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(wildcard_fd_is_valid(dir_fd));
+        assert(filename);
+
+        r = read_one_line_file_at(dir_fd, filename, &s);
+        if (r < 0)
+                return r;
+
+        return parse_boolean(s);
 }
 
 int verify_file_at(int dir_fd, const char *fn, const char *blob, bool accept_extra_nl) {
@@ -881,7 +898,7 @@ int script_get_shebang_interpreter(const char *path, char **ret) {
         _cleanup_free_ char *p = NULL;
         const char *s = line;
 
-        r = extract_first_word(&s, &p, /* separators = */ NULL, /* flags = */ 0);
+        r = extract_first_word(&s, &p, /* separators= */ NULL, /* flags= */ 0);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1007,13 +1024,19 @@ static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int 
 
         /* A combination of fopen() with openat() */
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(mode);
         assert(ret);
 
         if (dir_fd == AT_FDCWD && path && open_flags == 0)
                 f = fopen(path, mode);
-        else {
+        else if (dir_fd == XAT_FDROOT && path && open_flags == 0) {
+                _cleanup_free_ char *j = strjoin("/", path);
+                if (!j)
+                        return -ENOMEM;
+
+                f = fopen(j, mode);
+        } else {
                 _cleanup_close_ int fd = -EBADF;
                 int mode_flags;
 
@@ -1048,7 +1071,7 @@ static int xfopenat_unix_socket(int dir_fd, const char *path, const char *bind_n
         FILE *f;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(ret);
 
         sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
@@ -1096,7 +1119,7 @@ int xfopenat_full(
         FILE *f = NULL;  /* avoid false maybe-uninitialized warning */
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(mode);
         assert(ret);
 
@@ -1366,6 +1389,8 @@ int read_timestamp_file(const char *fn, usec_t *ret) {
         _cleanup_free_ char *ln = NULL;
         uint64_t t;
         int r;
+
+        assert(ret);
 
         r = read_one_line_file(fn, &ln);
         if (r < 0)
@@ -1653,5 +1678,65 @@ int warn_file_is_world_accessible(const char *filename, struct stat *st, const c
         else
                 log_warning("%s has %04o mode that is too permissive, please adjust the ownership and access mode.",
                             filename, st->st_mode & 07777);
+        return 0;
+}
+
+int write_data_file_atomic_at(
+                int dir_fd,
+                const char *path,
+                const struct iovec *iovec,
+                WriteDataFileFlags flags) {
+
+        int r;
+
+        assert(wildcard_fd_is_valid(dir_fd));
+
+        /* This is a cousin of write_string_file_atomic(), but operates with arbitrary struct iovec binary
+         * data (rather than strings), works without FILE* streams, and does direct syscalls instead. */
+
+        _cleanup_free_ char *dn = NULL, *fn = NULL;
+        r = path_split_prefix_filename(path, &dn, &fn);
+        if (IN_SET(r, -EADDRNOTAVAIL, O_DIRECTORY))
+                return -EISDIR; /* path refers to "." or "/" (which are dirs, which we cannot write), or is suffixed with "/" */
+        if (r < 0)
+                return r;
+
+        _cleanup_close_ int mfd = -EBADF;
+        if (dn) {
+                /* If there's a directory component, readjust our position */
+                r = chaseat(XAT_FDROOT,
+                            dir_fd,
+                            dn,
+                            FLAGS_SET(flags, WRITE_DATA_FILE_MKDIR_0755) ? CHASE_MKDIR_0755 : 0,
+                            /* ret_path= */ NULL,
+                            &mfd);
+                if (r < 0)
+                        return r;
+
+                dir_fd = mfd;
+        }
+
+        _cleanup_free_ char *t = NULL;
+        _cleanup_close_ int fd = open_tmpfile_linkable_at(dir_fd, fn, O_WRONLY|O_CLOEXEC, &t);
+        if (fd < 0)
+                return fd;
+
+        CLEANUP_TMPFILE_AT(dir_fd, t);
+
+        if (iovec_is_set(iovec)) {
+                r = loop_write(fd, iovec->iov_base, iovec->iov_len);
+                if (r < 0)
+                        return r;
+        }
+
+        r = fchmod_umask(fd, FLAGS_SET(flags, WRITE_DATA_FILE_MODE_0400) ? 0400 : 0644);
+        if (r < 0)
+                return r;
+
+        r = link_tmpfile_at(fd, dir_fd, t, fn, LINK_TMPFILE_REPLACE);
+        if (r < 0)
+                return r;
+
+        t = mfree(t); /* disarm CLEANUP_TMPFILE_AT */
         return 0;
 }

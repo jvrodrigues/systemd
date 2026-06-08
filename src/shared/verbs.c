@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
 #include "env-util.h"
+#include "format-table.h"
 #include "log.h"
 #include "string-util.h"
 #include "strv.h"
+#include "terminal-util.h"
 #include "verbs.h"
 #include "virt.h"
 
@@ -57,43 +57,53 @@ bool should_bypass(const char *env_prefix) {
         return true;
 }
 
-const Verb* verbs_find_verb(const char *name, const Verb verbs[]) {
-        assert(verbs);
+static bool verb_is_metadata(const Verb *verb) {
+        /* A metadata entry that is not a real verb, like the group marker */
+        return FLAGS_SET(ASSERT_PTR(verb)->flags, VERB_GROUP_MARKER);
+}
 
-        for (size_t i = 0; verbs[i].dispatch; i++)
-                if (name ? streq(name, verbs[i].verb) : FLAGS_SET(verbs[i].flags, VERB_DEFAULT))
-                        return verbs + i;
+const Verb* verbs_find_verb(const char *name, const Verb verbs[], const Verb verbs_end[]) {
+        assert(verbs);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+        assert(verbs[0].verb);
+
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                if (verb_is_metadata(verb))
+                        continue;
+
+                if (name ? streq(name, verb->verb) : FLAGS_SET(verb->flags, VERB_DEFAULT))
+                        return verb;
+        }
 
         /* At the end of the list? */
         return NULL;
 }
 
-int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
-        const Verb *verb;
-        const char *name;
-        int r, left;
+int _dispatch_verb(char **args, const Verb verbs[], const Verb verbs_end[], void *userdata) {
+        int r;
 
         assert(verbs);
-        assert(verbs[0].dispatch);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
         assert(verbs[0].verb);
-        assert(argc >= 0);
-        assert(argv);
-        assert(argc >= optind);
 
-        left = argc - optind;
-        argv += optind;
-        optind = 0;
-        name = argv[0];
+        const char *name = args ? args[0] : NULL;
+        size_t left = strv_length(args);
 
-        verb = verbs_find_verb(name, verbs);
+        const Verb *verb = verbs_find_verb(name, verbs, verbs_end);
         if (!verb) {
                 _cleanup_strv_free_ char **verb_strv = NULL;
 
-                for (size_t i = 0; verbs[i].dispatch; i++) {
-                        r = strv_extend(&verb_strv, verbs[i].verb);
+                for (verb = verbs; verb < verbs_end; verb++) {
+                        if (verb_is_metadata(verb))
+                                continue;
+
+                        r = strv_extend(&verb_strv, verb->verb);
                         if (r < 0)
                                 return log_oom();
                 }
+                assert(!strv_isempty(verb_strv));  /* At least one verb should be defined… */
 
                 if (name) {
                         /* Be more helpful to the user, and give a hint what the user might have wanted to type. */
@@ -114,18 +124,16 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
                                                "Command verb required (one of %s).", joined);
                 }
 
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Command verb '%s' required.", verbs[0].verb);
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Command verb '%s' required.", verb_strv[0]);
         }
 
         if (!name)
                 left = 1;
 
-        if (verb->min_args != VERB_ANY &&
-            (unsigned) left < verb->min_args)
+        if (verb->min_args != VERB_ANY && left < verb->min_args)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too few arguments.");
 
-        if (verb->max_args != VERB_ANY &&
-            (unsigned) left > verb->max_args)
+        if (verb->max_args != VERB_ANY && left > verb->max_args)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too many arguments.");
 
         if ((verb->flags & VERB_ONLINE_ONLY) && running_in_chroot_or_offline()) {
@@ -134,7 +142,119 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
         }
 
         if (!name)
-                return verb->dispatch(1, STRV_MAKE(verb->verb), userdata);
+                return verb->dispatch(1, STRV_MAKE(verb->verb), verb->data, userdata);
 
-        return verb->dispatch(left, argv, userdata);
+        assert(left < INT_MAX);  /* args are derived from argc+argv, so their size must fit in an int. */
+        return verb->dispatch(left, args, verb->data, userdata);
+}
+
+#define VERB_SYNOPSIS_WIDTH_SANE 25
+
+static const char* find_point_to_break(const char *s, size_t max_width) {
+        /* Locate the first space, preferably after max_width, or the last space otherwise.
+         * Return the part after the space. */
+
+        if (strlen(s) <= max_width)
+                return NULL;
+
+        const char *p = strchr(s + max_width, ' ') ?: strrchr(s, ' ');
+        return p ? p + 1 : NULL;
+}
+
+static int verb_add_help_one(Table *table, const Verb *verb) {
+        assert(table);
+        assert(verb);
+
+        bool is_default = FLAGS_SET(verb->flags, VERB_DEFAULT);
+        int r;
+
+        /* We indent the option string by two spaces. We could set the minimum cell width and
+         * right-align for a similar result, but that'd be more work. This is only used for
+         * display. */
+        _cleanup_free_ char *s = strjoin("  ",
+                                         is_default ? "[" : "",
+                                         verb->verb,
+                                         verb->argspec ? " " : "",
+                                         strempty(verb->argspec),
+                                         is_default ? "]" : "");
+        if (!s)
+                return log_oom();
+
+        const char *ss = NULL;
+        if (columns() < VERB_SYNOPSIS_WIDTH_SANE * 4) {
+                /* If the synopsis is very wide, try to split it up. But do this only if the terminal
+                 * is not very wide. If it _is_ wide, the broken up synopsis would look silly. */
+                const char *p = find_point_to_break(s, VERB_SYNOPSIS_WIDTH_SANE), *p2 = NULL;
+                if (p) {
+                        const char *s1 = strndupa_safe(s, p - s), *s2 = NULL;
+
+                        p2 = find_point_to_break(p, VERB_SYNOPSIS_WIDTH_SANE - 4); /* we indent by two spaces more */
+                        if (p2)
+                                s2 = strndupa_safe(p, p2 - p);
+
+                        if (s2)
+                                ss = strjoina(s1, "\n    ", s2, "\n    ", p2);
+                        else
+                                ss = strjoina(s1, "\n    ", p);
+                }
+        }
+
+        r = table_add_cell(table, NULL, TABLE_STRING, ss ?: s);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        _cleanup_strv_free_ char **t = strv_split(verb->help, /* separators= */ NULL);
+        if (!t)
+                return log_oom();
+
+        r = table_add_many(table, TABLE_STRV_WRAPPED, t);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        return 0;
+}
+
+int _verbs_get_help_table(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const char *group,
+                Table **ret) {
+        int r;
+
+        assert(verbs);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+        assert(ret);
+
+        _cleanup_(table_unrefp) Table *table = table_new("verb", "help");
+        if (!table)
+                return log_oom();
+
+        bool in_group = group == NULL;  /* Are we currently in the section on the array that forms
+                                         * group <group>? The first part is the default group, so
+                                         * if the group was not specified, we are in. */
+
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                assert(verb->verb);
+
+                bool group_marker = FLAGS_SET(verb->flags, VERB_GROUP_MARKER);
+                if (!in_group) {
+                        in_group = group_marker && streq(group, verb->verb);
+                        continue;
+                }
+                if (group_marker)
+                        break;  /* End of group */
+
+                if (!verb->help)
+                        /* No help string — we do not show the verb */
+                        continue;
+
+                r = verb_add_help_one(table, verb);
+                if (r < 0)
+                        return r;
+        }
+
+        table_set_header(table, false);
+        *ret = TAKE_PTR(table);
+        return 0;
 }

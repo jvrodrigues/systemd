@@ -309,7 +309,7 @@ _public_ int sd_device_monitor_stop(sd_device_monitor *m) {
                         return r;
 
                 /* Leave from all multicast groups to prevent the buffer is filled. */
-                r = device_monitor_update_multicast_groups(m, /* add = */ false);
+                r = device_monitor_update_multicast_groups(m, /* add= */ false);
                 if (r < 0)
                         return r;
 
@@ -376,7 +376,7 @@ _public_ int sd_device_monitor_start(sd_device_monitor *m, sd_device_monitor_han
                         return r;
 
                 /* Then, join the saved broadcast groups again. */
-                r = device_monitor_update_multicast_groups(m, /* add = */ true);
+                r = device_monitor_update_multicast_groups(m, /* add= */ true);
                 if (r < 0)
                         return r;
 
@@ -537,7 +537,7 @@ static bool check_sender_uid(sd_device_monitor *m, uid_t uid) {
                 return true;
 
         if (!m->mapped_userns_uid_range) {
-                r = uid_range_load_userns(/* path = */ NULL, UID_RANGE_USERNS_INSIDE, &m->mapped_userns_uid_range);
+                r = uid_range_load_userns(/* path= */ NULL, UID_RANGE_USERNS_INSIDE, &m->mapped_userns_uid_range);
                 if (r < 0)
                         log_monitor_errno(m, r, "Failed to load UID ranges mapped to the current user namespace, ignoring: %m");
         }
@@ -783,6 +783,8 @@ int device_monitor_send(
 
 static void bpf_stmt(struct sock_filter *ins, unsigned *i,
                      unsigned short code, unsigned data) {
+        assert(i);
+
         ins[(*i)++] = (struct sock_filter) {
                 .code = code,
                 .k = data,
@@ -792,6 +794,8 @@ static void bpf_stmt(struct sock_filter *ins, unsigned *i,
 static void bpf_jmp(struct sock_filter *ins, unsigned *i,
                     unsigned short code, unsigned data,
                     unsigned short jt, unsigned short jf) {
+        assert(i);
+
         ins[(*i)++] = (struct sock_filter) {
                 .code = code,
                 .jt = jt,
@@ -942,7 +946,7 @@ _public_ int sd_device_monitor_filter_add_match_sysattr(sd_device_monitor *m, co
                 hashmap = &m->nomatch_sysattr_filter;
 
         /* TODO: unset m->filter_uptodate on success when we support this filter on BPF. */
-        return update_match_strv(hashmap, sysattr, value, /* clear_on_null = */ true);
+        return update_match_strv(hashmap, sysattr, value, /* clear_on_null= */ true);
 }
 
 _public_ int sd_device_monitor_filter_add_match_parent(sd_device_monitor *m, sd_device *device, int match) {

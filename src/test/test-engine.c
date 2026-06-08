@@ -97,7 +97,7 @@ int main(int argc, char *argv[]) {
         if (manager_errno_skip_test(r))
                 return log_tests_skipped_errno(r, "manager_new");
         assert_se(r >= 0);
-        assert_se(manager_startup(m, NULL, NULL, NULL) >= 0);
+        assert_se(manager_startup(m, NULL, NULL, NULL, NULL) >= 0);
 
         printf("Load1:\n");
         assert_se(manager_load_startable_unit_or_warn(m, "a.service", NULL, &a) >= 0);
@@ -184,32 +184,32 @@ int main(int argc, char *argv[]) {
         assert_se(manager_add_job(m, JOB_START, a_conj, JOB_REPLACE, NULL, &j) == -EDEADLK);
         manager_dump_jobs(m, stdout, /* patterns= */ NULL, "\t");
 
-        assert_se(!hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
-        assert_se(!hashmap_get(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
-        assert_se(!hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
-        assert_se(!hashmap_get(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
 
         assert_se(unit_add_dependency(a, UNIT_PROPAGATES_RELOAD_TO, b, true, UNIT_DEPENDENCY_UDEV) >= 0);
         assert_se(unit_add_dependency(a, UNIT_PROPAGATES_RELOAD_TO, c, true, UNIT_DEPENDENCY_PROC_SWAP) >= 0);
 
-        assert_se( hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
-        assert_se( hashmap_get(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
-        assert_se( hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
-        assert_se( hashmap_get(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_TRUE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
+        ASSERT_TRUE(hashmap_contains(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_TRUE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
+        ASSERT_TRUE(hashmap_contains(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
 
         unit_remove_dependencies(a, UNIT_DEPENDENCY_UDEV);
 
-        assert_se(!hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
-        assert_se(!hashmap_get(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
-        assert_se( hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
-        assert_se( hashmap_get(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_TRUE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
+        ASSERT_TRUE(hashmap_contains(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
 
         unit_remove_dependencies(a, UNIT_DEPENDENCY_PROC_SWAP);
 
-        assert_se(!hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
-        assert_se(!hashmap_get(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
-        assert_se(!hashmap_get(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
-        assert_se(!hashmap_get(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), b));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(b, UNIT_RELOAD_PROPAGATED_FROM), a));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(a, UNIT_PROPAGATES_RELOAD_TO), c));
+        ASSERT_FALSE(hashmap_contains(unit_get_dependencies(c, UNIT_RELOAD_PROPAGATED_FROM), a));
 
         assert_se(manager_load_unit(m, "unit-with-multiple-dashes.service", NULL, NULL, &unit_with_multiple_dashes) >= 0);
 

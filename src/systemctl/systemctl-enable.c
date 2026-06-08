@@ -13,13 +13,11 @@
 #include "path-lookup.h"
 #include "path-util.h"
 #include "string-util.h"
-#include "strv-fundamental.h"
 #include "strv.h"
 #include "systemctl.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-enable.h"
 #include "systemctl-start-unit.h"
-#include "systemctl-sysv-compat.h"
 #include "systemctl-util.h"
 #include "unit-name.h"
 #include "verbs.h"
@@ -81,7 +79,7 @@ static int normalize_names(char **names) {
         return 0;
 }
 
-int verb_enable(int argc, char *argv[], void *userdata) {
+int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
         const char *verb = ASSERT_PTR(argv[0]);
         _cleanup_strv_free_ char **names = NULL;
         int carries_install_info = -1;
@@ -96,19 +94,6 @@ int verb_enable(int argc, char *argv[], void *userdata) {
         r = mangle_names(operation, ASSERT_PTR(strv_skip(argv, 1)), &names);
         if (r < 0)
                 return r;
-
-        r = enable_sysv_units(verb, names);
-        if (r < 0)
-                return r;
-
-        /* If the operation was fully executed by the SysV compat, let's finish early */
-        if (strv_isempty(names)) {
-                if (arg_no_reload || install_client_side() != INSTALL_CLIENT_SIDE_NO)
-                        return 0;
-
-                r = daemon_reload(ACTION_RELOAD, /* graceful= */ false);
-                return r > 0 ? 0 : r;
-        }
 
         if (streq(verb, "disable"))
                 r = normalize_names(names);
@@ -272,7 +257,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 else
                         assert_not_reached();
 
-                install_changes_dump(r, verb, changes, n_changes, arg_quiet);
+                r = install_changes_dump(r, verb, changes, n_changes, arg_quiet);
                 if (r < 0)
                         return r;
         }
@@ -405,7 +390,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
 
                                 assert(!STR_IN_SET(start_verb, "start", "restart"));
 
-                                r = unit_name_replace_instance_full(unit_name, "*", /* accept_glob = */ true, &globbed);
+                                r = unit_name_replace_instance_full(unit_name, "*", /* accept_glob= */ true, &globbed);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to glob unit name '%s': %m", unit_name);
 
@@ -416,7 +401,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                                 return log_oom();
                 }
 
-                return verb_start(strv_length(new_args), new_args, userdata);
+                return verb_start(strv_length(new_args), new_args, data, userdata);
         }
 
         return 0;

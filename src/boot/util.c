@@ -4,10 +4,10 @@
 
 #include "efi-log.h"
 #include "efi-string.h"
-#include "memory-util-fundamental.h"
+#include "memory-util.h"
 #include "proto/device-path.h"
 #include "proto/simple-text-io.h"
-#include "string-util-fundamental.h"
+#include "string-util.h"
 #include "util.h"
 #include "version.h"
 
@@ -195,6 +195,32 @@ EFI_STATUS file_read(
         return file_handle_read(handle, offset, size, ret, ret_size);
 }
 
+EFI_STATUS load_file_from_simple_filesystem(const EFI_DEVICE_PATH *device_path, char **file_buffer, size_t *file_size) {
+        EFI_STATUS err;
+        EFI_HANDLE device_handle;
+        EFI_DEVICE_PATH *file_dp = (EFI_DEVICE_PATH *) device_path;
+
+        assert(device_path);
+        assert(file_buffer);
+        assert(file_size);
+
+        err = BS->LocateDevicePath(MAKE_GUID_PTR(EFI_SIMPLE_FILE_SYSTEM_PROTOCOL), &file_dp, &device_handle);
+        if (err != EFI_SUCCESS)
+                return err;
+
+        _cleanup_file_close_ EFI_FILE *root = NULL;
+        err = open_volume(device_handle, &root);
+        if (err != EFI_SUCCESS)
+                return err;
+
+        _cleanup_free_ char16_t *dp_str = NULL;
+        err = device_path_to_str(file_dp, &dp_str);
+        if (err != EFI_SUCCESS)
+                return err;
+
+        return file_read(root, dp_str, 0, 0, file_buffer, file_size);
+}
+
 void set_attribute_safe(size_t attr) {
         /* Various UEFI implementations suppress color changes from a color to the same color. Often, we want
          * to force out the color change though, hence change the color here once, and then back. We simply
@@ -344,6 +370,7 @@ EFI_STATUS open_directory(
         EFI_STATUS err;
 
         assert(root);
+        assert(ret);
 
         /* Opens a file, and then verifies it is actually a directory */
 
@@ -515,6 +542,51 @@ void *xmalloc(size_t size) {
         void *p = NULL;
         assert_se(BS->AllocatePool(EfiLoaderData, size, &p) == EFI_SUCCESS);
         return p;
+}
+
+Pages xmalloc_aligned_pages(
+                EFI_ALLOCATE_TYPE type,
+                EFI_MEMORY_TYPE memory_type,
+                size_t n_pages,
+                size_t alignment,
+                EFI_PHYSICAL_ADDRESS addr) {
+
+        EFI_PHYSICAL_ADDRESS aligned = addr;
+
+        /* Allow to pass block_io->Media->IoAlign to this function directly.
+         * alignment <= 1 means no alignment is required, in that case just
+         * allocate pages directly.
+         */
+        if (alignment <= 1)
+                alignment = EFI_PAGE_SIZE;
+
+        assert(ISPOWEROF2(alignment));
+
+        if (alignment <= EFI_PAGE_SIZE) {
+                assert_se(BS->AllocatePages(type, memory_type, n_pages, &aligned) == EFI_SUCCESS);
+                return (Pages) {
+                        .addr = aligned,
+                        .n_pages = n_pages,
+                };
+        }
+
+        size_t total_pages = n_pages + EFI_SIZE_TO_PAGES(alignment);
+        assert_se(BS->AllocatePages(type, memory_type, total_pages, &addr) == EFI_SUCCESS);
+
+        aligned = ALIGN_TO(addr, alignment);
+        size_t unaligned_pages = EFI_SIZE_TO_PAGES(aligned - addr);
+        if (unaligned_pages > 0)
+                assert_se(BS->FreePages(addr, unaligned_pages) == EFI_SUCCESS);
+
+        addr = aligned + n_pages * EFI_PAGE_SIZE;
+        unaligned_pages = total_pages - n_pages - unaligned_pages;
+        if (unaligned_pages > 0)
+                assert_se(BS->FreePages(addr, unaligned_pages) == EFI_SUCCESS);
+
+        return (Pages) {
+                .addr = aligned,
+                .n_pages = n_pages,
+        };
 }
 
 bool free_and_xstrdup16(char16_t **p, const char16_t *s) {

@@ -24,7 +24,6 @@
 #include "escape.h"
 #include "event-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "hashmap.h"
 #include "log.h"
@@ -100,7 +99,8 @@ typedef enum JobType {
         JOB_LIST,
         JOB_DESCRIBE,
         JOB_CHECK_NEW,
-        JOB_UPDATE,
+        JOB_ACQUIRE,
+        JOB_INSTALL,
         JOB_VACUUM,
         JOB_DESCRIBE_FEATURE,
         _JOB_TYPE_MAX,
@@ -121,7 +121,7 @@ struct Job {
 
         JobType type;
         bool offline;
-        char *version; /* Passed into sysupdate for JOB_DESCRIBE and JOB_UPDATE */
+        char *version; /* Passed into sysupdate for JOB_DESCRIBE, JOB_ACQUIRE and JOB_INSTALL */
         char *feature; /* Passed into sysupdate for JOB_DESCRIBE_FEATURE */
 
         unsigned progress_percent;
@@ -153,7 +153,8 @@ static const char* const job_type_table[_JOB_TYPE_MAX] = {
         [JOB_LIST]             = "list",
         [JOB_DESCRIBE]         = "describe",
         [JOB_CHECK_NEW]        = "check-new",
-        [JOB_UPDATE]           = "update",
+        [JOB_ACQUIRE]          = "acquire",
+        [JOB_INSTALL]          = "install",
         [JOB_VACUUM]           = "vacuum",
         [JOB_DESCRIBE_FEATURE] = "describe-feature",
 };
@@ -182,8 +183,9 @@ static Job *job_free(Job *j) {
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Job*, job_free);
-DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(job_hash_ops, uint64_t, uint64_hash_func, uint64_compare_func,
-                                      Job, job_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(job_hash_ops,
+                                              uint64_t, uint64_hash_func, uint64_compare_func,
+                                              Job, job_free);
 
 static int job_new(JobType type, Target *t, sd_bus_message *msg, JobComplete complete_cb, Job **ret) {
         _cleanup_(job_freep) Job *j = NULL;
@@ -220,6 +222,11 @@ static int job_new(JobType type, Target *t, sd_bus_message *msg, JobComplete com
         return 0;
 }
 
+/* Is Job in the set of jobs which require Target.busy to be set so they run exclusively? */
+static bool job_requires_busy(Job *j) {
+        return IN_SET(j->type, JOB_ACQUIRE, JOB_INSTALL, JOB_VACUUM);
+}
+
 static int job_parse_child_output(int _fd, sd_json_variant **ret) {
         _cleanup_close_ int fd = ASSERT_FD(_fd); /* Take ownership of the passed fd */
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
@@ -238,8 +245,13 @@ static int job_parse_child_output(int _fd, sd_json_variant **ret) {
                 return 0;
         }
 
-        r = sd_json_parse_file_at(/* f = */ NULL, fd, /* path = */ NULL, /* flags = */ 0,
-                                  &v, /* reterr_line = */ NULL, /* reterr_column = */ NULL);
+        r = sd_json_parse_fd(
+                        /* path= */ "stdout",
+                        TAKE_FD(fd),
+                        SD_JSON_PARSE_DONATE_FD|SD_JSON_PARSE_SEEK0,
+                        &v,
+                        /* reterr_line= */ NULL,
+                        /* reterr_column= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse child output as JSON: %m");
 
@@ -332,7 +344,7 @@ static int job_on_exit(sd_event_source *s, const siginfo_t *si, void *userdata) 
         assert(s);
         assert(si);
 
-        if (IN_SET(j->type, JOB_UPDATE, JOB_VACUUM)) {
+        if (job_requires_busy(j)) {
                 assert(j->target->busy);
                 j->target->busy = false;
         }
@@ -430,7 +442,7 @@ static int job_start(Job *j) {
 
         assert(j);
 
-        if (IN_SET(j->type, JOB_UPDATE, JOB_VACUUM) && j->target->busy)
+        if (job_requires_busy(j) && j->target->busy)
                 return log_notice_errno(SYNTHETIC_ERRNO(EBUSY), "Target %s busy, ignoring job.", j->target->name);
 
         stdout_fd = memfd_new("sysupdate-stdout");
@@ -453,8 +465,8 @@ static int job_start(Job *j) {
                         NULL, /* maybe --verify=no */
                         NULL, /* maybe --component=, --root=, or --image= */
                         NULL, /* maybe --offline */
-                        NULL, /* list, check-new, update, vacuum, features */
-                        NULL, /* maybe version (for list, update), maybe feature (features) */
+                        NULL, /* list, check-new, acquire, update, vacuum, features */
+                        NULL, /* maybe version (for list, acquire, update), maybe feature (features) */
                         NULL
                 };
                 size_t k = 2;
@@ -479,7 +491,7 @@ static int job_start(Job *j) {
                 if (target_arg)
                         cmd[k++] = target_arg;
 
-                if (j->offline)
+                if (j->offline || j->type == JOB_INSTALL)  /* install is implemented as `update --offline` */
                         cmd[k++] = "--offline";
 
                 switch (j->type) {
@@ -497,8 +509,13 @@ static int job_start(Job *j) {
                         cmd[k++] = "check-new";
                         break;
 
-                case JOB_UPDATE:
-                        cmd[k++] = "update";
+                case JOB_ACQUIRE:
+                        cmd[k++] = "acquire";
+                        cmd[k++] = empty_to_null(j->version);
+                        break;
+
+                case JOB_INSTALL:
+                        cmd[k++] = "update";  /* install is implemented as `update --offline` */
                         cmd[k++] = empty_to_null(j->version);
                         break;
 
@@ -543,11 +560,11 @@ static int job_start(Job *j) {
         r = sd_event_source_set_child_process_own(j->child, true);
         if (r < 0)
                 return log_error_errno(r, "Event loop failed to take ownership of child process: %m");
-        TAKE_PIDREF(pid);
+        pidref_done(&pid); /* disarm sigkill_wait */
 
         j->stdout_fd = TAKE_FD(stdout_fd);
 
-        if (IN_SET(j->type, JOB_UPDATE, JOB_VACUUM))
+        if (job_requires_busy(j))
                 j->target->busy = true;
 
         return 0;
@@ -578,18 +595,19 @@ static int job_method_cancel(sd_bus_message *msg, void *userdata, sd_bus_error *
         case JOB_LIST:
         case JOB_DESCRIBE:
         case JOB_CHECK_NEW:
-                action = "org.freedesktop.sysupdate1.check";
+                action = "org.freedesktop.sysupdate1.cancel-check";
                 break;
 
-        case JOB_UPDATE:
+        case JOB_ACQUIRE:
+        case JOB_INSTALL:
                 if (j->version)
-                        action = "org.freedesktop.sysupdate1.update-to-version";
+                        action = "org.freedesktop.sysupdate1.cancel-update-to-version";
                 else
-                        action = "org.freedesktop.sysupdate1.update";
+                        action = "org.freedesktop.sysupdate1.cancel-update";
                 break;
 
         case JOB_VACUUM:
-                action = "org.freedesktop.sysupdate1.vacuum";
+                action = "org.freedesktop.sysupdate1.cancel-vacuum";
                 break;
 
         case JOB_DESCRIBE_FEATURE:
@@ -715,8 +733,9 @@ static Target *target_free(Target *t) {
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Target*, target_free);
-DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(target_hash_ops, char, string_hash_func, string_compare_func,
-                                      Target, target_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(target_hash_ops,
+                                              char, string_hash_func, string_compare_func,
+                                              Target, target_free);
 
 static int target_new(Manager *m, TargetClass class, const char *name, const char *path, Target **ret) {
         _cleanup_(target_freep) Target *t = NULL;
@@ -756,7 +775,6 @@ static int target_new(Manager *m, TargetClass class, const char *name, const cha
 static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
         _cleanup_close_pair_ int pipe[2] = EBADF_PAIR;
         _cleanup_(pidref_done_sigkill_wait) PidRef pid = PIDREF_NULL;
-        _cleanup_fclose_ FILE *f = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ char *target_arg = NULL;
         int r;
@@ -830,11 +848,14 @@ static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
         }
 
         pipe[1] = safe_close(pipe[1]);
-        f = take_fdopen(&pipe[0], "r");
-        if (!f)
-                return -errno;
 
-        r = sd_json_parse_file(f, "stdout", 0, &v, NULL, NULL);
+        r = sd_json_parse_fd(
+                        "stdout",
+                        TAKE_FD(pipe[0]),
+                        SD_JSON_PARSE_DONATE_FD,
+                        &v,
+                        /* reterr_line= */ NULL,
+                        /* reterr_column= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse JSON: %m");
 
@@ -962,8 +983,8 @@ static int target_method_describe(sd_bus_message *msg, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        if (isempty(version))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Version must be specified");
+        if (!version_is_valid(version))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
         if ((flags & ~SD_SYSUPDATE_FLAGS_ALL) != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags specified");
@@ -1065,7 +1086,7 @@ static int target_method_check_new(sd_bus_message *msg, void *userdata, sd_bus_e
         return 1;
 }
 
-static int target_method_update_finished_early(
+static int target_method_acquire_finished_early(
                 sd_bus_message *msg,
                 const Job *j,
                 sd_json_variant *json,
@@ -1073,12 +1094,12 @@ static int target_method_update_finished_early(
 
         /* Called when job finishes w/ a successful exit code, but before any work begins.
          * This happens when there is no candidate (i.e. we're already up-to-date), or
-         * specified update is already installed. */
+         * specified update is already acquired. */
         return sd_bus_error_setf(error, BUS_ERROR_NO_UPDATE_CANDIDATE,
-                                 "Job exited successfully with no work to do, assume already updated");
+                                 "Job exited successfully with no work to do, assume already acquired");
 }
 
-static int target_method_update_detach(sd_bus_message *msg, const Job *j) {
+static int target_method_acquire_detach(sd_bus_message *msg, const Job *j) {
         int r;
 
         assert(msg);
@@ -1091,7 +1112,7 @@ static int target_method_update_detach(sd_bus_message *msg, const Job *j) {
         return 0;
 }
 
-static int target_method_update(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+static int target_method_acquire(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Target *t = ASSERT_PTR(userdata);
         _cleanup_(job_freep) Job *j = NULL;
         const char *version, *action;
@@ -1107,10 +1128,16 @@ static int target_method_update(sd_bus_message *msg, void *userdata, sd_bus_erro
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
 
+        /* We don’t have a separate polkit action for acquire/install as they are both effectively (part of)
+         * an update anyway. */
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
-        else
+        else {
+                if (!version_is_valid(version))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
+
                 action = "org.freedesktop.sysupdate1.update-to-version";
+        }
 
         const char *details[] = {
                 "class", target_class_to_string(t->class),
@@ -1130,10 +1157,98 @@ static int target_method_update(sd_bus_message *msg, void *userdata, sd_bus_erro
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = job_new(JOB_UPDATE, t, msg, target_method_update_finished_early, &j);
+        r = job_new(JOB_ACQUIRE, t, msg, target_method_acquire_finished_early, &j);
         if (r < 0)
                 return r;
-        j->detach_cb = target_method_update_detach;
+        j->detach_cb = target_method_acquire_detach;
+
+        j->version = strdup(version);
+        if (!j->version)
+                return -ENOMEM;
+
+        r = job_start(j);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to start job: %m");
+        TAKE_PTR(j);
+
+        return 1;
+}
+
+static int target_method_install_finished_early(
+                sd_bus_message *msg,
+                const Job *j,
+                sd_json_variant *json,
+                sd_bus_error *error) {
+
+        /* Called when job finishes w/ a successful exit code, but before any work begins.
+         * This happens when there is no candidate (i.e. we're already up-to-date), or
+         * specified update is already installed. */
+        return sd_bus_error_setf(error, BUS_ERROR_NO_UPDATE_CANDIDATE,
+                                 "Job exited successfully with no work to do, assume already installed");
+}
+
+static int target_method_install_detach(sd_bus_message *msg, const Job *j) {
+        int r;
+
+        assert(msg);
+        assert(j);
+
+        r = sd_bus_reply_method_return(msg, "sto", j->version, j->id, j->object_path);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        return 0;
+}
+
+static int target_method_install(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Target *t = ASSERT_PTR(userdata);
+        _cleanup_(job_freep) Job *j = NULL;
+        const char *version, *action;
+        uint64_t flags;
+        int r;
+
+        assert(msg);
+
+        r = sd_bus_message_read(msg, "st", &version, &flags);
+        if (r < 0)
+                return r;
+
+        if (flags != 0)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
+
+        /* We don’t have a separate polkit action for acquire/install as they are both effectively (part of)
+         * an update anyway. */
+        if (isempty(version))
+                action = "org.freedesktop.sysupdate1.update";
+        else {
+                if (!version_is_valid(version))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
+
+                action = "org.freedesktop.sysupdate1.update-to-version";
+        }
+
+        const char *details[] = {
+                "class", target_class_to_string(t->class),
+                "name", t->name,
+                "version", version,
+                NULL
+        };
+
+        r = bus_verify_polkit_async(
+                        msg,
+                        action,
+                        details,
+                        &t->manager->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
+
+        r = job_new(JOB_INSTALL, t, msg, target_method_install_finished_early, &j);
+        if (r < 0)
+                return r;
+        j->detach_cb = target_method_install_detach;
 
         j->version = strdup(version);
         if (!j->version)
@@ -1225,7 +1340,9 @@ static int target_method_get_version(sd_bus_message *msg, void *userdata, sd_bus
 
         version_json = sd_json_variant_by_key(v, "current");
         if (!version_json)
-                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'current'");
+                version_json = sd_json_variant_by_key(v, "current+pending");
+        if (!version_json)
+                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'current' or 'current+pending'");
 
         if (sd_json_variant_is_null(version_json))
                 return sd_bus_reply_method_return(msg, "s", "");
@@ -1316,6 +1433,19 @@ static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_b
         return sd_bus_message_send(reply);
 }
 
+static bool feature_name_is_valid(const char *name) {
+        if (isempty(name))
+                return false;
+
+        if (!ascii_is_valid(name))
+                return false;
+
+        if (!filename_is_valid(strjoina(name, ".feature.d")))
+                return false;
+
+        return true;
+}
+
 static int target_method_describe_feature(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Target *t = ASSERT_PTR(userdata);
         _cleanup_(job_freep) Job *j = NULL;
@@ -1329,8 +1459,8 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         if (r < 0)
                 return r;
 
-        if (isempty(feature))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Feature must be specified");
+        if (!feature_name_is_valid(feature))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid feature name");
 
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
@@ -1349,19 +1479,6 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         TAKE_PTR(j); /* Avoid job from being killed & freed */
 
         return 1;
-}
-
-static bool feature_name_is_valid(const char *name) {
-        if (isempty(name))
-                return false;
-
-        if (!ascii_is_valid(name))
-                return false;
-
-        if (!filename_is_valid(strjoina(name, ".feature.d")))
-                return false;
-
-        return true;
 }
 
 static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
@@ -1580,10 +1697,16 @@ static const sd_bus_vtable target_vtable[] = {
                                 target_method_check_new,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
 
-        SD_BUS_METHOD_WITH_ARGS("Update",
+        SD_BUS_METHOD_WITH_ARGS("Acquire",
                                 SD_BUS_ARGS("s", new_version, "t", flags),
                                 SD_BUS_RESULT("s", new_version, "t", job_id, "o", job_path),
-                                target_method_update,
+                                target_method_acquire,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("Install",
+                                SD_BUS_ARGS("s", new_version, "t", flags),
+                                SD_BUS_RESULT("s", new_version, "t", job_id, "o", job_path),
+                                target_method_install,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_METHOD_WITH_ARGS("Vacuum",
@@ -1738,7 +1861,7 @@ static int manager_new(Manager **ret) {
 
         r = notify_socket_prepare(
                         m->event,
-                        SD_EVENT_PRIORITY_NORMAL - 1, /* Make this processed before SIGCHLD. */
+                        SD_EVENT_PRIORITY_NORMAL - 1, /* Make this processed before worker exit. */
                         manager_on_notify,
                         m,
                         &m->notify_socket_path);
@@ -1764,6 +1887,9 @@ static int manager_enumerate_image_class(Manager *m, TargetClass class) {
 
                 if (image_is_host(image))
                         continue; /* We already enroll the host ourselves */
+
+                if (image->type == IMAGE_MSTACK)
+                        continue; /* systemd-sysupdate doesn't support mstack images yet */
 
                 r = target_new(m, class, image->name, image->path, &t);
                 if (r < 0)
@@ -1959,7 +2085,7 @@ static int method_list_appstream(sd_bus_message *msg, void *userdata, sd_bus_err
                 if (r < 0)
                         return r;
 
-                r = strv_extend_strv_consume(&urls, target_appstream, /* filter_duplicates = */ true);
+                r = strv_extend_strv_consume(&urls, target_appstream, /* filter_duplicates= */ true);
                 if (r < 0)
                         return r;
         }
@@ -2077,9 +2203,6 @@ static int run(int argc, char *argv[]) {
                 return r;
 
         umask(0022);
-
-        /* SIGCHLD signal must be blocked for sd_event_add_child to work */
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)

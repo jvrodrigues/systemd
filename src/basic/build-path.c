@@ -195,6 +195,8 @@ static int find_build_dir_binary(const char *fn, char **ret) {
 
 static int find_environment_binary(const char *fn, const char **ret) {
 
+        assert(ret);
+
         /* If a path such as /usr/lib/systemd/systemd-foobar is specified, then this will check for an
          * environment variable SYSTEMD_FOOBAR_PATH and return it if set. */
 
@@ -264,7 +266,7 @@ int pin_callout_binary(const char *path, char **ret_path) {
         const char *e;
         if (find_environment_binary(fn, &e) >= 0) {
                 /* The environment variable counts. We'd fail if the executable is not available/invalid. */
-                r = open_and_check_executable(e, /* root = */ NULL, ret_path, &fd);
+                r = open_and_check_executable(e, /* root= */ NULL, ret_path, &fd);
                 if (r < 0)
                         return r;
 
@@ -273,13 +275,13 @@ int pin_callout_binary(const char *path, char **ret_path) {
 
         _cleanup_free_ char *np = NULL;
         if (find_build_dir_binary(fn, &np) >= 0) {
-                r = open_and_check_executable(np, /* root = */ NULL, ret_path, &fd);
+                r = open_and_check_executable(np, /* root= */ NULL, ret_path, &fd);
                 if (r >= 0)
                         return fd;
         }
 
-        r = find_executable_full(path, /* root = */ NULL,
-                                 /* exec_search_path = */ NULL, /* use_path_envvar = */ true,
+        r = find_executable_full(path, /* root= */ NULL,
+                                 /* exec_search_path= */ NULL, /* use_path_envvar= */ true,
                                  ret_path, &fd);
         if (r < 0)
                 return r;

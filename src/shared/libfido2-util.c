@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-dlopen.h"
+
 #include "libfido2-util.h"
 #include "log.h"
 
@@ -11,6 +13,7 @@
 #include "format-table.h"
 #include "glyph-util.h"
 #include "iovec-util.h"
+#include "locale-util.h"
 #include "plymouth-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -20,8 +23,6 @@
 #ifndef FIDO_ERR_UV_BLOCKED
 #define FIDO_ERR_UV_BLOCKED 0x3c
 #endif
-
-static void *libfido2_dl = NULL;
 
 DLSYM_PROTOTYPE(fido_assert_allow_cred) = NULL;
 DLSYM_PROTOTYPE(fido_assert_free) = NULL;
@@ -78,17 +79,19 @@ static void fido_log_propagate_handler(const char *s) {
 
 #endif
 
-int dlopen_libfido2(void) {
+int dlopen_libfido2(int log_level) {
 #if HAVE_LIBFIDO2
+        static void *libfido2_dl = NULL;
         int r;
 
-        ELF_NOTE_DLOPEN("fido2",
+        SD_ELF_NOTE_DLOPEN(
+                        "fido2",
                         "Support fido2 for encryption and authentication",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
                         "libfido2.so.1");
 
         r = dlopen_many_sym_or_warn(
-                        &libfido2_dl, "libfido2.so.1", LOG_DEBUG,
+                        &libfido2_dl, "libfido2.so.1", log_level,
                         DLSYM_ARG(fido_assert_allow_cred),
                         DLSYM_ARG(fido_assert_free),
                         DLSYM_ARG(fido_assert_hmac_secret_len),
@@ -145,7 +148,8 @@ int dlopen_libfido2(void) {
 
         return 0;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libfido2 support is not compiled in.");
 #endif
 }
 
@@ -158,13 +162,14 @@ static int verify_features(
                 bool *ret_has_rk,
                 bool *ret_has_client_pin,
                 bool *ret_has_up,
-                bool *ret_has_uv) {
+                bool *ret_has_uv,
+                bool *ret_has_always_uv) {
 
         _cleanup_(fido_cbor_info_free_wrapper) fido_cbor_info_t *di = NULL;
         bool found_extension = false;
         char **e, **o;
         const bool *b;
-        bool has_rk = false, has_client_pin = false, has_up = true, has_uv = false; /* Defaults are per table in 5.4 in FIDO2 spec */
+        bool has_rk = false, has_client_pin = false, has_up = true, has_uv = false, has_always_uv = false; /* Defaults are per table in 5.4 in FIDO2 spec */
         size_t n;
         int r;
 
@@ -205,6 +210,8 @@ static int verify_features(
                         has_up = b[i];
                 if (streq(o[i], "uv"))
                         has_uv = b[i];
+                if (streq(o[i], "alwaysUv"))
+                        has_always_uv = b[i];
         }
 
         if (!found_extension)
@@ -215,11 +222,13 @@ static int verify_features(
         log_debug("Has rk ('Resident Key') support: %s\n"
                   "Has clientPin support: %s\n"
                   "Has up ('User Presence') support: %s\n"
-                  "Has uv ('User Verification') support: %s\n",
+                  "Has uv ('User Verification') support: %s\n"
+                  "Has alwaysUv ('User Verification' required): %s\n",
                   yes_no(has_rk),
                   yes_no(has_client_pin),
                   yes_no(has_up),
-                  yes_no(has_uv));
+                  yes_no(has_uv),
+                  yes_no(has_always_uv));
 
         if (ret_has_rk)
                 *ret_has_rk = has_rk;
@@ -229,6 +238,8 @@ static int verify_features(
                 *ret_has_up = has_up;
         if (ret_has_uv)
                 *ret_has_uv = has_uv;
+        if (ret_has_always_uv)
+                *ret_has_always_uv = has_always_uv;
 
         return 0;
 }
@@ -320,7 +331,7 @@ static int fido2_is_cred_in_specific_token(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_ERR, NULL, NULL, &has_up, &has_uv);
+        r = verify_features(d, path, LOG_ERR, /* ret_has_rk= */ NULL, /* ret_has_client_pin= */ NULL, &has_up, &has_uv, /* ret_has_always_uv= */ NULL);
         if (r == -ENODEV) { /* Not a FIDO2 device or lacking HMAC-SECRET extension */
                 log_debug_errno(r, "%s is not a FIDO2 device, or it lacks the hmac-secret extension", path);
                 return false;
@@ -350,7 +361,7 @@ static int fido2_is_cred_in_specific_token(
         /* According to CTAP 2.1 specification, to do pre-flight we need to set up option to false
          * with optionally pinUvAuthParam in assertion[1]. But for authenticator that doesn't support
          * user presence, once up option is present, the authenticator may return CTAP2_ERR_UNSUPPORTED_OPTION[2].
-         * So we simplely omit the option in that case.
+         * So we simply omit the option in that case.
          * Reference:
          * 1: https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#pre-flight
          * 2: https://fidoalliance.org/specs/fido-v2.0-ps-20190130/fido-client-to-authenticator-protocol-v2.0-ps-20190130.html#authenticatorGetAssertion (in step 5)
@@ -432,7 +443,7 @@ static int fido2_use_hmac_hash_specific_token(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_ERR, NULL, &has_client_pin, &has_up, &has_uv);
+        r = verify_features(d, path, LOG_ERR, /* ret_has_rk= */ NULL, &has_client_pin, &has_up, &has_uv, /* ret_has_always_uv= */ NULL);
         if (r < 0)
                 return r;
 
@@ -483,7 +494,7 @@ static int fido2_use_hmac_hash_specific_token(
                         log_notice("%s%sPlease confirm presence on security token to unlock.",
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
-                        plymouth_start_interaction("Please confirm presence on security token to unlock.", &plymouth_displayed);
+                        plymouth_start_interaction(_("Please confirm presence on security token to unlock."), &plymouth_displayed);
                 }
         }
 
@@ -499,7 +510,7 @@ static int fido2_use_hmac_hash_specific_token(
                         log_notice("%s%sPlease verify user on security token to unlock.",
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
-                        plymouth_start_interaction("Please verify user on security token to unlock.", &plymouth_displayed);
+                        plymouth_start_interaction(_("Please verify user on security token to unlock."), &plymouth_displayed);
                 }
         }
 
@@ -540,7 +551,7 @@ static int fido2_use_hmac_hash_specific_token(
                                 log_notice("%s%sPlease confirm presence on security to unlock.",
                                            emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                            emoji_enabled() ? " " : "");
-                                plymouth_start_interaction("Please confirm presence on security token to unlock.", &plymouth_displayed);
+                                plymouth_start_interaction(_("Please confirm presence on security token to unlock."), &plymouth_displayed);
                                 retry_with_up = true;
                         }
 
@@ -648,9 +659,9 @@ int fido2_use_hmac_hash(
         fido_dev_info_t *di = NULL;
         int r;
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 support is not installed.");
+                return r;
 
         if (device) {
                 r = fido2_is_cred_in_specific_token(device, rp_id, cid, cid_size, required);
@@ -745,7 +756,7 @@ int fido2_generate_hmac_hash(
         _cleanup_(fido_cred_free_wrapper) fido_cred_t *c = NULL;
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
         _cleanup_(erase_and_freep) char *used_pin = NULL;
-        bool has_rk, has_client_pin, has_up, has_uv;
+        bool has_rk, has_client_pin, has_up, has_uv, has_always_uv;
         _cleanup_free_ char *cid_copy = NULL;
         size_t cid_size, secret_size;
         const void *cid, *secret;
@@ -774,9 +785,9 @@ int fido2_generate_hmac_hash(
         assert((lock_with & ~(FIDO2ENROLL_PIN|FIDO2ENROLL_UP|FIDO2ENROLL_UV)) == 0);
         assert(iovec_is_set(salt));
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 token support is not installed.");
+                return r;
 
         d = sym_fido_dev_new();
         if (!d)
@@ -787,7 +798,7 @@ int fido2_generate_hmac_hash(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", device, sym_fido_strerr(r));
 
-        r = verify_features(d, device, LOG_ERR, &has_rk, &has_client_pin, &has_up, &has_uv);
+        r = verify_features(d, device, LOG_ERR, &has_rk, &has_client_pin, &has_up, &has_uv, &has_always_uv);
         if (r < 0)
                 return r;
 
@@ -805,6 +816,19 @@ int fido2_generate_hmac_hash(
         if (!has_uv && FLAGS_SET(lock_with, FIDO2ENROLL_UV)) {
                 log_notice("Locking with user verification test requested, but FIDO2 device %s does not support it, disabling.", device);
                 lock_with &= ~FIDO2ENROLL_UV;
+        }
+
+        if (has_always_uv && !(FLAGS_SET(lock_with, FIDO2ENROLL_PIN) || FLAGS_SET(lock_with, FIDO2ENROLL_UV))) {
+                if (has_uv) {
+                        log_notice("FIDO2 device %s enforces 'always user verification', forcing user verification.", device);
+                        lock_with |= FIDO2ENROLL_UV;
+                } else if (has_client_pin) {
+                        log_notice("FIDO2 device %s enforces 'always user verification', but doesn't support user verification, forcing PIN.", device);
+                        lock_with |= FIDO2ENROLL_PIN;
+                } else
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "FIDO2 device %s enforces 'always user verification', but doesn't support user verification or PIN, cannot proceed.",
+                                               device);
         }
 
         c = sym_fido_cred_new();
@@ -899,7 +923,7 @@ int fido2_generate_hmac_hash(
                         _cleanup_strv_free_erase_ char **pin = NULL;
                         AskPasswordRequest req = {
                                 .tty_fd = -EBADF,
-                                .message = "Please enter security token PIN:",
+                                .message = _("Please enter security token PIN:"),
                                 .icon = askpw_icon,
                                 .keyring = "fido2-pin",
                                 .credential = askpw_credential,
@@ -1124,7 +1148,8 @@ static int check_device_is_fido2_with_hmac_secret(
                 bool *ret_has_rk,
                 bool *ret_has_client_pin,
                 bool *ret_has_up,
-                bool *ret_has_uv) {
+                bool *ret_has_uv,
+                bool *ret_has_always_uv) {
 
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
         int r;
@@ -1138,9 +1163,18 @@ static int check_device_is_fido2_with_hmac_secret(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_DEBUG, ret_has_rk, ret_has_client_pin, ret_has_up, ret_has_uv);
+        r = verify_features(d, path, LOG_DEBUG, ret_has_rk, ret_has_client_pin, ret_has_up, ret_has_uv, ret_has_always_uv);
         if (r == -ENODEV) { /* Not a FIDO2 device, or not implementing 'hmac-secret' */
-                *ret_has_rk = *ret_has_client_pin = *ret_has_up = *ret_has_uv = false;
+                if (ret_has_rk)
+                        *ret_has_rk = false;
+                if (ret_has_client_pin)
+                        *ret_has_client_pin = false;
+                if (ret_has_up)
+                        *ret_has_up = false;
+                if (ret_has_uv)
+                        *ret_has_uv = false;
+                if (ret_has_always_uv)
+                        *ret_has_always_uv = false;
                 return false;
         }
         if (r < 0)
@@ -1158,9 +1192,9 @@ int fido2_list_devices(void) {
         fido_dev_info_t *di = NULL;
         int r;
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 token support is not installed.");
+                return r;
 
         di = sym_fido_dev_info_new(allocated);
         if (!di)
@@ -1178,7 +1212,7 @@ int fido2_list_devices(void) {
                 goto finish;
         }
 
-        t = table_new("path", "manufacturer", "product", "compatible", "rk", "clientpin", "up", "uv");
+        t = table_new("path", "manufacturer", "product", "compatible", "rk", "clientpin", "up", "uv", "alwaysuv");
         if (!t) {
                 r = log_oom();
                 goto finish;
@@ -1186,7 +1220,7 @@ int fido2_list_devices(void) {
 
         for (size_t i = 0; i < found; i++) {
                 const fido_dev_info_t *entry;
-                bool has_rk, has_client_pin, has_up, has_uv;
+                bool has_rk, has_client_pin, has_up, has_uv, has_always_uv;
 
                 entry = sym_fido_dev_info_ptr(di, i);
                 if (!entry) {
@@ -1195,7 +1229,7 @@ int fido2_list_devices(void) {
                         goto finish;
                 }
 
-                r = check_device_is_fido2_with_hmac_secret(sym_fido_dev_info_path(entry), &has_rk, &has_client_pin, &has_up, &has_uv);
+                r = check_device_is_fido2_with_hmac_secret(sym_fido_dev_info_path(entry), &has_rk, &has_client_pin, &has_up, &has_uv, &has_always_uv);
                 if (r < 0)
                         goto finish;
                 bool compatible = r > 0;
@@ -1209,25 +1243,25 @@ int fido2_list_devices(void) {
                                 TABLE_BOOLEAN_CHECKMARK, has_rk,
                                 TABLE_BOOLEAN_CHECKMARK, has_client_pin,
                                 TABLE_BOOLEAN_CHECKMARK, has_up,
-                                TABLE_BOOLEAN_CHECKMARK, has_uv);
+                                TABLE_BOOLEAN_CHECKMARK, has_uv,
+                                TABLE_BOOLEAN_CHECKMARK, has_always_uv);
                 if (r < 0) {
                         table_log_add_error(r);
                         goto finish;
                 }
         }
 
-        r = table_print(t, stdout);
-        if (r < 0) {
-                log_error_errno(r, "Failed to show device table: %m");
+        r = table_print_or_warn(t);
+        if (r < 0)
                 goto finish;
-        }
 
-        if (table_get_rows(t) > 1)
+        if (!table_isempty(t))
                 printf("\n"
                        "%1$sLegend: RK        %2$s Resident key%3$s\n"
                        "%1$s        CLIENTPIN %2$s PIN request%3$s\n"
                        "%1$s        UP        %2$s User presence%3$s\n"
-                       "%1$s        UV        %2$s User verification%3$s\n",
+                       "%1$s        UV        %2$s User verification%3$s\n"
+                       "%1$s        AlwaysUV  %2$s User verification Required%3$s\n",
                        ansi_grey(),
                        glyph(GLYPH_ARROW_RIGHT),
                        ansi_normal());
@@ -1252,9 +1286,9 @@ int fido2_find_device_auto(char **ret) {
         const char *path;
         int r;
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 token support is not installed.");
+                return r;
 
         di = sym_fido_dev_info_new(di_size);
         if (!di)
@@ -1287,7 +1321,8 @@ int fido2_find_device_auto(char **ret) {
                         /* ret_has_rk= */ NULL,
                         /* ret_has_client_pin= */ NULL,
                         /* ret_has_up= */ NULL,
-                        /* ret_has_uv= */ NULL);
+                        /* ret_has_uv= */ NULL,
+                        /* ret_has_always_uv= */ NULL);
         if (r < 0)
                 goto finish;
         if (!r) {
@@ -1328,9 +1363,9 @@ int fido2_have_device(const char *device) {
 
         /* Return == 0 if not devices are found, > 0 if at least one is found */
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 support is not installed.");
+                return r;
 
         if (device) {
                 if (access(device, F_OK) < 0) {

@@ -2,25 +2,26 @@
 
 #include "password-quality-util-passwdqc.h"
 
+#include "errno-util.h"          /* IWYU pragma: keep */
+#include "log.h"                 /* IWYU pragma: keep */
+
 #if HAVE_PASSWDQC
 
 #include <passwdqc.h>
 
+#include "sd-dlopen.h"
+
 #include "alloc-util.h"
 #include "dlfcn-util.h"
-#include "errno-util.h"
-#include "log.h"
 #include "memory-util.h"
 #include "strv.h"
 
-static void *passwdqc_dl = NULL;
-
-DLSYM_PROTOTYPE(passwdqc_params_reset) = NULL;
-DLSYM_PROTOTYPE(passwdqc_params_load) = NULL;
-DLSYM_PROTOTYPE(passwdqc_params_parse) = NULL;
-DLSYM_PROTOTYPE(passwdqc_params_free) = NULL;
-DLSYM_PROTOTYPE(passwdqc_check) = NULL;
-DLSYM_PROTOTYPE(passwdqc_random) = NULL;
+static DLSYM_PROTOTYPE(passwdqc_params_reset) = NULL;
+static DLSYM_PROTOTYPE(passwdqc_params_load) = NULL;
+static DLSYM_PROTOTYPE(passwdqc_params_parse) = NULL;
+static DLSYM_PROTOTYPE(passwdqc_params_free) = NULL;
+static DLSYM_PROTOTYPE(passwdqc_check) = NULL;
+static DLSYM_PROTOTYPE(passwdqc_random) = NULL;
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(passwdqc_params_t*, sym_passwdqc_params_free, passwdqc_params_freep, NULL);
 
@@ -32,7 +33,7 @@ static int pwqc_allocate_context(passwdqc_params_t **ret) {
 
         assert(ret);
 
-        r = dlopen_passwdqc();
+        r = dlopen_passwdqc(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -117,7 +118,7 @@ int check_password_quality(
 
                 check_reason = sym_passwdqc_check(&params->qc, password, old, &pw);
         } else
-                check_reason = sym_passwdqc_check(&params->qc, password, old, /* pw = */ NULL);
+                check_reason = sym_passwdqc_check(&params->qc, password, old, /* pw= */ NULL);
 
         if (check_reason) {
                 if (ret_error) {
@@ -135,15 +136,18 @@ int check_password_quality(
 
 #endif
 
-int dlopen_passwdqc(void) {
+int dlopen_passwdqc(int log_level) {
 #if HAVE_PASSWDQC
-        ELF_NOTE_DLOPEN("passwdqc",
+        static void *passwdqc_dl = NULL;
+
+        SD_ELF_NOTE_DLOPEN(
+                        "passwdqc",
                         "Support for password quality checks",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
                         "libpasswdqc.so.1");
 
         return dlopen_many_sym_or_warn(
-                        &passwdqc_dl, "libpasswdqc.so.1", LOG_DEBUG,
+                        &passwdqc_dl, "libpasswdqc.so.1", log_level,
                         DLSYM_ARG(passwdqc_params_reset),
                         DLSYM_ARG(passwdqc_params_load),
                         DLSYM_ARG(passwdqc_params_parse),
@@ -151,6 +155,7 @@ int dlopen_passwdqc(void) {
                         DLSYM_ARG(passwdqc_check),
                         DLSYM_ARG(passwdqc_random));
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libpasswdqc support is not compiled in.");
 #endif
 }

@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <math.h>
-
 #include "alloc-util.h"
 #include "bitmap.h"
 #include "dns-answer.h"                 /* IWYU pragma: keep */
@@ -13,6 +11,7 @@
 #include "hash-funcs.h"
 #include "hexdecoct.h"
 #include "json-util.h"
+#include "math-util.h"
 #include "memory-util.h"
 #include "siphash24.h"
 #include "string-table.h"
@@ -773,9 +772,9 @@ static char* format_location(uint32_t latitude, uint32_t longitude, uint32_t alt
         int lat = latitude >= 1U<<31 ? (int) (latitude - (1U<<31)) : (int) ((1U<<31) - latitude);
         int lon = longitude >= 1U<<31 ? (int) (longitude - (1U<<31)) : (int) ((1U<<31) - longitude);
         double alt = altitude >= 10000000u ? altitude - 10000000u : -(double)(10000000u - altitude);
-        double siz = (size >> 4) * exp10((double) (size & 0xF));
-        double hor = (horiz_pre >> 4) * exp10((double) (horiz_pre & 0xF));
-        double ver = (vert_pre >> 4) * exp10((double) (vert_pre & 0xF));
+        double siz = (size >> 4) * xexp10i(size & 0xF);
+        double hor = (horiz_pre >> 4) * xexp10i(horiz_pre & 0xF);
+        double ver = (vert_pre >> 4) * xexp10i(vert_pre & 0xF);
 
         if (asprintf(&s, "%d %d %.3f %c %d %d %.3f %c %.2fm %.2fm %.2fm %.2fm",
                      (lat / 60000 / 60),
@@ -2012,6 +2011,7 @@ int dns_resource_record_get_cname_target(DnsResourceKey *key, DnsResourceRecord 
 
         assert(key);
         assert(cname);
+        assert(ret);
 
         /* Checks if the RR `cname` is a CNAME/DNAME RR that matches the specified `key`. If so, returns the
          * target domain. If not, returns -EUNATCH */
@@ -2215,6 +2215,12 @@ int dns_resource_key_from_json(sd_json_variant *v, DnsResourceKey **ret) {
         if (r < 0)
                 return r;
 
+        r = dns_name_is_valid(p.name);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EBADMSG;
+
         key = dns_resource_key_new(p.class, p.type, p.name);
         if (!key)
                 return -ENOMEM;
@@ -2302,7 +2308,6 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
         int r;
 
         assert(rr);
-        assert(ret);
 
         r = dns_resource_key_to_json(rr->key, &k);
         if (r < 0)
@@ -2508,9 +2513,101 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
 
         default:
                 /* Can't provide broken-down format */
-                *ret = NULL;
+                if (ret)
+                        *ret = NULL;
                 return 0;
         }
+}
+
+int dns_resource_record_from_json(sd_json_variant *v, DnsResourceRecord **ret) {
+        int r;
+
+        assert(v);
+
+        sd_json_variant *k = sd_json_variant_by_key(v, "key");
+        if (!k)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Resource record entry lacks key field, refusing.");
+
+        _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
+        r = dns_resource_key_from_json(k, &key);
+        if (r < 0)
+                return r;
+
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+        rr = dns_resource_record_new(key);
+        if (!rr)
+                return log_oom_debug();
+
+        /* Note, for now we only support the most common subset of RRs for decoding here. Please send patches for more. */
+        switch (key->type) {
+
+        case DNS_TYPE_PTR:
+        case DNS_TYPE_NS:
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_DNAME: {
+                _cleanup_free_ char *name = NULL;
+
+                static const struct sd_json_dispatch_field table[] = {
+                        { "name", SD_JSON_VARIANT_STRING, sd_json_dispatch_string, 0, SD_JSON_MANDATORY },
+                        { "key",  SD_JSON_VARIANT_OBJECT, NULL,                    0, SD_JSON_MANDATORY },
+                        {}
+                };
+
+                r = sd_json_dispatch(v, table, /* flags= */ 0, &name);
+                if (r < 0)
+                        return r;
+
+                r = dns_name_is_valid(name);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -EBADMSG;
+
+                rr->ptr.name = TAKE_PTR(name);
+                break;
+        }
+
+        case DNS_TYPE_A: {
+                struct in_addr addr = {};
+
+                static const struct sd_json_dispatch_field table[] = {
+                        { "address", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_in_addr, 0, SD_JSON_MANDATORY },
+                        { "key",     SD_JSON_VARIANT_OBJECT,        NULL,                  0, SD_JSON_MANDATORY },
+                        {}
+                };
+
+                r = sd_json_dispatch(v, table, /* flags= */ 0, &addr);
+                if (r < 0)
+                        return r;
+
+                rr->a.in_addr = addr;
+                break;
+        }
+
+        case DNS_TYPE_AAAA: {
+                struct in6_addr addr = {};
+
+                static const struct sd_json_dispatch_field table[] = {
+                        { "address", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_in6_addr, 0, SD_JSON_MANDATORY },
+                        { "key",     SD_JSON_VARIANT_OBJECT,        NULL,                   0, SD_JSON_MANDATORY },
+                        {}
+                };
+
+                r = sd_json_dispatch(v, table, /* flags= */ 0, &addr);
+                if (r < 0)
+                        return r;
+
+                rr->aaaa.in6_addr = addr;
+                break;
+        }
+
+        default:
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Decoding DNS type %s is currently not supported.", dns_type_to_string(key->type));
+        }
+
+        if (ret)
+                *ret = TAKE_PTR(rr);
+        return 0;
 }
 
 static const char* const dnssec_algorithm_table[_DNSSEC_ALGORITHM_MAX_DEFINED] = {

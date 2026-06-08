@@ -3,6 +3,7 @@
 #include "alloc-util.h"
 #include "env-file.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "kernel-image.h"
 #include "log.h"
 #include "pe-binary.h"
@@ -27,7 +28,6 @@ static int uki_read_pretty_name(
                 char **ret) {
 
         _cleanup_free_ char *pname = NULL, *name = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ void *osrel = NULL;
         size_t osrel_size;
         int r;
@@ -42,7 +42,7 @@ static int uki_read_pretty_name(
                         pe_header,
                         sections,
                         ".osrel",
-                        /* max_size=*/ PE_SECTION_READ_MAX,
+                        /* max_size= */ PE_SECTION_READ_MAX,
                         &osrel,
                         &osrel_size);
         if (r == -ENXIO) { /* Section not found */
@@ -50,16 +50,12 @@ static int uki_read_pretty_name(
                 return 0;
         }
 
-        f = fmemopen(osrel, osrel_size, "r");
-        if (!f)
-                return log_error_errno(errno, "Failed to open embedded os-release file: %m");
-
-        r = parse_env_file(
-                        f, NULL,
+        r = parse_env_data(
+                        osrel, osrel_size, ".osrel",
                         "PRETTY_NAME", &pname,
                         "NAME",        &name);
         if (r < 0)
-                return log_error_errno(r, "Failed to parse embedded os-release file: %m");
+                return log_debug_errno(r, "Failed to parse embedded os-release file: %m");
 
         /* follow the same logic as os_release_pretty_name() */
         if (!isempty(pname))
@@ -69,7 +65,7 @@ static int uki_read_pretty_name(
         else {
                 char *n = strdup("Linux");
                 if (!n)
-                        return log_oom();
+                        return -ENOMEM;
 
                 *ret = n;
         }
@@ -119,7 +115,7 @@ static int inspect_uki(
         return 0;
 }
 
-int inspect_kernel(
+int inspect_kernel_full(
                 int dir_fd,
                 const char *filename,
                 KernelImageType *ret_type,
@@ -134,24 +130,23 @@ int inspect_kernel(
         _cleanup_close_ int fd = -EBADF;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-        assert(filename);
+        assert(wildcard_fd_is_valid(dir_fd));
 
-        fd = openat(dir_fd, filename, O_RDONLY|O_CLOEXEC);
+        fd = xopenat(dir_fd, filename, O_RDONLY|O_CLOEXEC);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open kernel image file '%s': %m", filename);
+                return log_debug_errno(fd, "Failed to open kernel image file '%s': %m", strna(filename));
 
         r = pe_load_headers(fd, &dos_header, &pe_header);
         if (r == -EBADMSG) /* not a valid PE file */
                 goto not_uki;
         if (r < 0)
-                return log_error_errno(r, "Failed to parse kernel image file '%s': %m", filename);
+                return log_debug_errno(r, "Failed to parse kernel image file '%s': %m", strna(filename));
 
         r = pe_load_sections(fd, dos_header, pe_header, &sections);
         if (r == -EBADMSG) /* not a valid PE file */
                 goto not_uki;
         if (r < 0)
-                return log_error_errno(r, "Failed to load PE sections from kernel image file '%s': %m", filename);
+                return log_debug_errno(r, "Failed to load PE sections from kernel image file '%s': %m", strna(filename));
 
         if (pe_is_uki(pe_header, sections)) {
                 r = inspect_uki(fd, pe_header, sections, ret_cmdline, ret_uname, ret_pretty_name);

@@ -10,12 +10,29 @@
 #  the Free Software Foundation; either version 2.1 of the License, or
 #  (at your option) any later version.
 
+# This implements the UAPI.15 "OSC 3008: Hierarchical Context Signalling"
+# specification for the shell prompt. For details see:
+# https://uapi-group.org/specifications/specs/osc_context/
+
+# This file is "activated" through systemd-tmpfiles which links it into
+# /etc/profile.d/. To disable this, remove the
+# /etc/profile.d/80-systemd-osc-context.sh symlink and mask the
+# 20-systemd-osc-context.conf snippet (as root):
+#
+#   test -h /etc/profile.d/80-systemd-osc-context.sh && \
+#     rm -v /etc/profile.d/80-systemd-osc-context.sh && \
+#     ln -s /dev/null /etc/tmpfiles.d/20-systemd-osc-context.conf
+
 # Not bash?
 [ -n "${BASH_VERSION:-}" ] || return 0
 
 # If we're on a "dumb" terminal, do not install the prompt.
 # Treat missing $TERM same as "dumb".
 [ "${TERM:-dumb}" = "dumb" ] && return 0
+
+# We need promptvars, otherwise the prompt strings won't undergo parameter expansion
+# and we'd print them literally
+shopt -q promptvars || return 0
 
 __systemd_osc_context_escape() {
     # Escape according to the OSC 3008 spec. Since this requires shelling out
@@ -24,27 +41,27 @@ __systemd_osc_context_escape() {
     # uuids, id128, hostnames, usernames, since they all come with syntax
     # requirements that exclude \ and ; anyway. This hence primarily is about
     # escaping the current working directory.
-    echo "$1" | sed -e 's/\\/\\x5x/g' -e 's/;/\\x3b/g'
+    echo "$1" | sed -e 's/\\/\\x5c/g' -e 's/;/\\x3b/g' -e 's/[[:cntrl:]]/⍰/g'
 }
 
 __systemd_osc_context_common() {
     if [ -f /etc/machine-id ]; then
-        printf ";machineid=%s" "$(</etc/machine-id)"
+        printf ";machineid=%.36s" "$(</etc/machine-id)"
     fi
-    printf ";user=%s;hostname=%s;bootid=%s;pid=%s" "$USER" "$HOSTNAME" "$(</proc/sys/kernel/random/boot_id)" "$$"
+    printf ";user=%.255s;hostname=%.255s;bootid=%.36s;pid=%.20d" "$USER" "$HOSTNAME" "$(</proc/sys/kernel/random/boot_id)" "$$"
 }
 
 __systemd_osc_context_precmdline() {
-    local systemd_exitstatus="$?"
+    local systemd_exitstatus="$?" systemd_signal
 
     # Close previous command
     if [ -n "${systemd_osc_context_cmd_id:-}" ]; then
-        if [ "$systemd_exitstatus" -ge 127 ]; then
-            printf "\033]3008;end=%s;exit=interrupt;signal=%s\033\\" "$systemd_osc_context_cmd_id" $((systemd_exitstatus-127))
+        if [ "$systemd_exitstatus" -gt 128 ] && systemd_signal=$(kill -l "$systemd_exitstatus" 2>&-); then
+            printf "\033]3008;end=%.64s;exit=failure;status=%d;signal=SIG%s\033\\" "$systemd_osc_context_cmd_id" "$systemd_exitstatus" "$systemd_signal"
         elif [ "$systemd_exitstatus" -ne 0 ]; then
-            printf "\033]3008;end=%s;exit=failure;status=%s\033\\" "$systemd_osc_context_cmd_id" $((systemd_exitstatus))
+            printf "\033]3008;end=%.64s;exit=failure;status=%d\033\\" "$systemd_osc_context_cmd_id" $((systemd_exitstatus))
         else
-            printf "\033]3008;end=%s;exit=success\033\\" "$systemd_osc_context_cmd_id"
+            printf "\033]3008;end=%.64s;exit=success\033\\" "$systemd_osc_context_cmd_id"
         fi
     fi
 
@@ -54,7 +71,7 @@ __systemd_osc_context_precmdline() {
     fi
 
     # Create or update the shell session
-    printf "\033]3008;start=%s%s;type=shell;cwd=%s\033\\" "$systemd_osc_context_shell_id" "$(__systemd_osc_context_common)" "$(__systemd_osc_context_escape "$PWD")"
+    printf "\033]3008;start=%.64s%s;type=shell;cwd=%.255s\033\\" "$systemd_osc_context_shell_id" "$(__systemd_osc_context_common)" "$(__systemd_osc_context_escape "$PWD")"
 
     # Prepare cmd id for next command
     read -r systemd_osc_context_cmd_id </proc/sys/kernel/random/uuid
@@ -64,7 +81,7 @@ __systemd_osc_context_ps0() {
     # Skip if PROMPT_COMMAND= is cleared manually or by other profiles.
     [ -n "${systemd_osc_context_cmd_id:-}" ] || return
 
-    printf "\033]3008;start=%s%s;type=command;cwd=%s\033\\" "$systemd_osc_context_cmd_id" "$(__systemd_osc_context_common)" "$(__systemd_osc_context_escape "$PWD")"
+    printf "\033]3008;start=%.64s%s;type=command;cwd=%.255s\033\\" "$systemd_osc_context_cmd_id" "$(__systemd_osc_context_common)" "$(__systemd_osc_context_escape "$PWD")"
 }
 
 if [ -n "${BASH_VERSION:-}" ]; then

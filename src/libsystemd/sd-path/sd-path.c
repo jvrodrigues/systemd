@@ -130,7 +130,7 @@ static int from_xdg_user_dir(const char *field, char **buffer, const char **ret)
 
                 const char *s = startswith(p, "$HOME/");
                 if (s)
-                        return from_home_dir(/* envname = */ NULL, s, buffer, ret);
+                        return from_home_dir(/* envname= */ NULL, s, buffer, ret);
 
                 if (path_is_absolute(p)) {
                         char *c = strdup(p);
@@ -145,7 +145,7 @@ static int from_xdg_user_dir(const char *field, char **buffer, const char **ret)
 fallback:
         /* The desktop directory defaults to $HOME/Desktop, the others to $HOME */
         if (streq(field, "XDG_DESKTOP_DIR"))
-                return from_home_dir(/* envname = */ NULL, "Desktop", buffer, ret);
+                return from_home_dir(/* envname= */ NULL, "Desktop", buffer, ret);
 
 home:
         r = get_home_dir(buffer);
@@ -281,6 +281,9 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
 
         case SD_PATH_USER_DESKTOP:
                 return from_xdg_user_dir("XDG_DESKTOP_DIR", buffer, ret);
+
+        case SD_PATH_USER_PROJECTS:
+                return from_xdg_user_dir("XDG_PROJECTS_DIR", buffer, ret);
 
         case SD_PATH_SYSTEMD_UTIL:
                 *ret = PREFIX_NOSLASH "/lib/systemd";

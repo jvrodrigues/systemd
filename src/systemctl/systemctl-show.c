@@ -302,10 +302,6 @@ typedef struct UnitStatusInfo {
         uint64_t io_read_bytes;
         uint64_t io_write_bytes;
 
-        uint64_t default_memory_min;
-        uint64_t default_memory_low;
-        uint64_t default_startup_memory_low;
-
         /* Exec Quotas */
         QuotaInfo exec_directories_quota[_EXEC_DIRECTORY_TYPE_MAX];
 
@@ -324,6 +320,9 @@ static void unit_status_info_done(UnitStatusInfo *info) {
 }
 
 static void format_active_state(const char *active_state, const char **active_on, const char **active_off) {
+        assert(active_on);
+        assert(active_off);
+
         if (streq_ptr(active_state, "failed")) {
                 *active_on = ansi_highlight_red();
                 *active_off = ansi_normal();
@@ -940,7 +939,7 @@ static void print_status_info(
                                 i->id,
                                 i->log_namespace,
                                 arg_output,
-                                /* n_columns = */ 0,
+                                /* n_columns= */ 0,
                                 i->inactive_exit_timestamp_monotonic,
                                 arg_lines,
                                 get_output_flags() | OUTPUT_BEGIN_NEWLINE,
@@ -2248,9 +2247,6 @@ static int show_one(
                 { "MemorySwapPeak",                 "t",               NULL,           offsetof(UnitStatusInfo, memory_swap_peak)                  },
                 { "MemoryZSwapCurrent",             "t",               NULL,           offsetof(UnitStatusInfo, memory_zswap_current)              },
                 { "MemoryAvailable",                "t",               NULL,           offsetof(UnitStatusInfo, memory_available)                  },
-                { "DefaultMemoryMin",               "t",               NULL,           offsetof(UnitStatusInfo, default_memory_min)                },
-                { "DefaultMemoryLow",               "t",               NULL,           offsetof(UnitStatusInfo, default_memory_low)                },
-                { "DefaultStartupMemoryLow",        "t",               NULL,           offsetof(UnitStatusInfo, default_startup_memory_low)        },
                 { "MemoryMin",                      "t",               NULL,           offsetof(UnitStatusInfo, memory_min)                        },
                 { "MemoryLow",                      "t",               NULL,           offsetof(UnitStatusInfo, memory_low)                        },
                 { "StartupMemoryLow",               "t",               NULL,           offsetof(UnitStatusInfo, startup_memory_low)                },
@@ -2489,7 +2485,7 @@ static int show_system_status(sd_bus *bus) {
         return 0;
 }
 
-int verb_show(int argc, char *argv[], void *userdata) {
+int verb_show(int argc, char *argv[], uintptr_t _data, void *userdata) {
         bool new_line = false, ellipsized = false;
         SystemctlShowMode show_mode;
         int r, ret = 0;

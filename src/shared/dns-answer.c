@@ -574,6 +574,8 @@ int dns_answer_remove_by_answer_keys(DnsAnswer **a, DnsAnswer *b) {
         DnsAnswerItem *item;
         int r;
 
+        assert(a);
+
         /* Removes all items from '*a' that have a matching key in 'b' */
 
         DNS_ANSWER_FOREACH_ITEM(item, b) {
@@ -896,7 +898,7 @@ int dns_answer_to_json(DnsAnswer *answer, sd_json_variant **ret) {
         }
 
         if (!ja)
-                return sd_json_variant_new_array(ret, /* array=*/ NULL, /* n= */ 0);
+                return sd_json_variant_new_array(ret, /* array= */ NULL, /* n= */ 0);
 
         *ret = TAKE_PTR(ja);
         return 0;

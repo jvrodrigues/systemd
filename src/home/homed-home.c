@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-json.h"
 
 #include "blockdev-util.h"
 #include "btrfs-util.h"
@@ -570,26 +571,24 @@ static int home_parse_worker_stdout(int _fd, UserRecord **ret) {
                 return 0;
         }
 
-        if (lseek(fd, 0, SEEK_SET) < 0)
-                return log_error_errno(errno, "Failed to seek to beginning of memfd: %m");
-
         f = take_fdopen(&fd, "r");
         if (!f)
                 return log_error_errno(errno, "Failed to reopen memfd: %m");
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *text = NULL;
+                if (fseek(f, 0, SEEK_SET) < 0)
+                        return log_error_errno(errno, "Failed to seek to beginning of memfd: %m");
 
+                _cleanup_free_ char *text = NULL;
                 r = read_full_stream(f, &text, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read from client: %m");
 
                 log_debug("Got from worker: %s", text);
-                rewind(f);
         }
 
         unsigned line = 0, column = 0;
-        r = sd_json_parse_file(f, "stdout", SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
+        r = sd_json_parse_file(f, "stdout", SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE|SD_JSON_PARSE_SEEK0, &v, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse identity at %u:%u: %m", line, column);
 
@@ -1327,7 +1326,7 @@ static int home_start_work(
         if (r == 0) {
                 /* Child */
 
-                if (setenv("NOTIFY_SOCKET", h->manager->notify_socket_path, /* overwrite = */ true) < 0) {
+                if (setenv("NOTIFY_SOCKET", h->manager->notify_socket_path, /* overwrite= */ true) < 0) {
                         log_error_errno(errno, "Failed to set $NOTIFY_SOCKET: %m");
                         _exit(EXIT_FAILURE);
                 }
@@ -2011,7 +2010,7 @@ int home_passwd(Home *h,
                  * data. This is useful as a way to propagate updated user records into the LUKS backends
                  * properly. */
 
-                r = user_record_make_hashed_password(c, new_secret->password, /* extend = */ false);
+                r = user_record_make_hashed_password(c, new_secret->password, /* extend= */ false);
                 if (r < 0)
                         return r;
 
@@ -2233,9 +2232,10 @@ int home_killall(Home *h) {
         assert(h->uid > 0); /* We never should be UID 0 */
 
         /* Let's kill everything matching the specified UID */
-        r = safe_fork("(sd-killer)",
-                      FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_WAIT|FORK_LOG|FORK_REOPEN_LOG,
-                      NULL);
+        r = pidref_safe_fork(
+                        "(sd-killer)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_WAIT|FORK_LOG|FORK_REOPEN_LOG,
+                        /* ret= */ NULL);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -2689,7 +2689,7 @@ int home_augment_status(
         r = sd_json_buildo(&status,
                            SD_JSON_BUILD_PAIR_STRING("state", home_state_to_string(state)),
                            SD_JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.Home")),
-                           SD_JSON_BUILD_PAIR("useFallback", SD_JSON_BUILD_BOOLEAN(!HOME_STATE_IS_ACTIVE(state))),
+                           SD_JSON_BUILD_PAIR_BOOLEAN("useFallback", !HOME_STATE_IS_ACTIVE(state)),
                            SD_JSON_BUILD_PAIR("fallbackShell", JSON_BUILD_CONST_STRING(BINDIR "/systemd-home-fallback-shell")),
                            SD_JSON_BUILD_PAIR("fallbackHomeDirectory", JSON_BUILD_CONST_STRING("/")),
                            SD_JSON_BUILD_PAIR_CONDITION(disk_size != UINT64_MAX, "diskSize", SD_JSON_BUILD_UNSIGNED(disk_size)),
@@ -3213,8 +3213,9 @@ static int home_get_image_path_seat(Home *h, char **ret) {
         if (stat(ip, &st) < 0)
                 return -errno;
 
-        if (!S_ISBLK(st.st_mode))
-                return -ENOTBLK;
+        r = stat_verify_block(&st);
+        if (r < 0)
+                return r;
 
         r = sd_device_new_from_stat_rdev(&d, &st);
         if (r < 0)
@@ -3299,11 +3300,14 @@ int home_wait_for_worker(Home *h) {
 
         log_info("Worker process for home %s is still running while exiting. Waiting for it to finish.", h->user_name);
 
-        r = wait_for_terminate_with_timeout(h->worker_pid.pid, 30 * USEC_PER_SEC);
+        siginfo_t si;
+        r = pidref_wait_for_terminate_full(&h->worker_pid, 30 * USEC_PER_SEC, &si);
         if (r == -ETIMEDOUT)
                 log_warning_errno(r, "Waiting for worker process for home %s timed out. Ignoring.", h->user_name);
         else if (r < 0)
-                log_warning_errno(r, "Failed to wait for worker process for home %s. Ignoring.", h->user_name);
+                log_warning_errno(r, "Failed to wait for worker process for home %s, ignoring: %m", h->user_name);
+        else if (si.si_code != CLD_EXITED || si.si_status != 0)
+                log_warning("Worker process for home %s failed with non-zero exit status. Ignoring.", h->user_name);
 
         (void) hashmap_remove_value(h->manager->homes_by_worker_pid, &h->worker_pid, h);
         pidref_done(&h->worker_pid);

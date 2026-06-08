@@ -39,7 +39,7 @@ char* setup_fake_runtime_dir(void) {
         char *t;
 
         ASSERT_OK(mkdtemp_malloc("/tmp/fake-xdg-runtime-XXXXXX", &t));
-        ASSERT_OK(setenv("XDG_RUNTIME_DIR", t, /* overwrite = */ true));
+        ASSERT_OK(setenv("XDG_RUNTIME_DIR", t, /* overwrite= */ true));
         return t;
 }
 
@@ -64,12 +64,14 @@ static void load_testdata_env(void) {
         }
 
         STRV_FOREACH_PAIR(k, v, pairs)
-                ASSERT_OK(setenv(*k, *v, /* overwrite = */ false));
+                ASSERT_OK(setenv(*k, *v, /* overwrite= */ false));
 }
 
 int get_testdata_dir(const char *suffix, char **ret) {
         const char *dir;
         char *p;
+
+        assert(ret);
 
         load_testdata_env();
 
@@ -146,7 +148,7 @@ bool have_namespaces(void) {
         /* Checks whether namespaces are available. In some cases they aren't. We do this by calling unshare(), and we
          * do so in a child process in order not to affect our own process. */
 
-        ASSERT_OK(r = pidref_safe_fork("(have_namespace)", /* flags = */ 0, &pid));
+        ASSERT_OK(r = pidref_safe_fork("(have_namespace)", /* flags= */ 0, &pid));
         if (r == 0) {
                 /* child */
                 if (detach_mount_namespace() < 0)
@@ -155,7 +157,7 @@ bool have_namespaces(void) {
                 _exit(EXIT_SUCCESS);
         }
 
-        ASSERT_OK(r = pidref_wait_for_terminate_and_check("(have_namespace)", &pid, /* flags = */ 0));
+        ASSERT_OK(r = pidref_wait_for_terminate_and_check("(have_namespace)", &pid, /* flags= */ 0));
         if (r == EXIT_SUCCESS)
                 return true;
 
@@ -359,7 +361,7 @@ const char* ci_environment(void) {
         if (getenv("SALSA_CI_IMAGES"))
                 return (ans = "salsa-ci");
 
-        FOREACH_STRING(var, "CI", "CONTINOUS_INTEGRATION") {
+        FOREACH_STRING(var, "CI", "CONTINUOUS_INTEGRATION") {
                 /* Those vars are booleans according to Semaphore and Travis docs:
                  * https://docs.travis-ci.com/user/environment-variables/#default-environment-variables
                  * https://docs.semaphoreci.com/ci-cd-environment/environment-variables/#ci
@@ -378,20 +380,18 @@ int run_test_table(const TestFunc *start, const TestFunc *end) {
         _cleanup_strv_free_ char **tests = NULL;
         int r = EXIT_SUCCESS;
         bool ran = false;
-        const char *e;
 
         if (!start)
                 return r;
 
-        e = getenv("TESTFUNCS");
+        const char *e = getenv("TESTFUNCS");
         if (e) {
-                r = strv_split_full(&tests, e, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to parse $TESTFUNCS: %m");
+                int n = strv_split_full(&tests, e, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+                if (n < 0)
+                        return log_error_errno(n, "Failed to parse $TESTFUNCS: %m");
         }
 
-        for (const TestFunc *t = ALIGN_PTR(start); t + 1 <= end; t = ALIGN_PTR(t + 1)) {
-
+        for (const TestFunc *t = start; t + 1 <= end; t++) {
                 if (tests && !strv_contains(tests, t->name))
                         continue;
 
@@ -448,7 +448,12 @@ int assert_signal_internal(int *ret_signal) {
                 return ASSERT_SIGNAL_FORK_CHILD;
         }
 
-        r = wait_for_terminate(r, &siginfo);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = pidref_set_pid(&pidref, r);
+        if (r < 0)
+                return r;
+
+        r = pidref_wait_for_terminate(&pidref, &siginfo);
         if (r < 0)
                 return r;
 

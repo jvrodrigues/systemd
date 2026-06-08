@@ -96,7 +96,7 @@ static void test_log_format_iovec_sentinel(
 
         va_start(ap, format);
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        ASSERT_OK(log_format_iovec(iovec, iovec_len, &n, /* newline_separator = */ false, ENOANO, format, ap));
+        ASSERT_OK(log_format_iovec(iovec, iovec_len, &n, /* newline_separator= */ false, ENOANO, format, ap));
         REENABLE_WARNING;
         va_end(ap);
 
@@ -104,9 +104,9 @@ static void test_log_format_iovec_sentinel(
 
         for (size_t i = 0; i < n; i++)
                 if (i < m)
-                        ASSERT_EQ(iovec_memcmp(&iovec[i], &IOVEC_MAKE_STRING(v[i])), 0);
+                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(v[i])));
                 else {
-                        ASSERT_EQ(iovec_memcmp(&iovec[i], &IOVEC_MAKE_STRING(expected[i - m])), 0);
+                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(expected[i - m])));
                         free(iovec[i].iov_base);
                 }
 
@@ -114,7 +114,7 @@ static void test_log_format_iovec_sentinel(
 
         va_start(ap, format);
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        ASSERT_OK(log_format_iovec(iovec, iovec_len, &n, /* newline_separator = */ true, ENOANO, format, ap));
+        ASSERT_OK(log_format_iovec(iovec, iovec_len, &n, /* newline_separator= */ true, ENOANO, format, ap));
         REENABLE_WARNING;
         va_end(ap);
 
@@ -122,12 +122,12 @@ static void test_log_format_iovec_sentinel(
 
         for (size_t i = 0; i < n; i++)
                 if (i < m)
-                        ASSERT_EQ(iovec_memcmp(&iovec[i], &IOVEC_MAKE_STRING(v[i])), 0);
+                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(v[i])));
                 else if ((i - m) % 2 == 0) {
-                        ASSERT_EQ(iovec_memcmp(&iovec[i], &IOVEC_MAKE_STRING(expected[(i - m) / 2])), 0);
+                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(expected[(i - m) / 2])));
                         free(iovec[i].iov_base);
                 } else
-                        ASSERT_EQ(iovec_memcmp(&iovec[i], &IOVEC_MAKE_STRING("\n")), 0);
+                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING("\n")));
 }
 
 #define test_log_format_iovec_one(...)                 \
@@ -234,7 +234,7 @@ static void test_log_context(void) {
                 _cleanup_(log_context_unrefp) LogContext *ctx = NULL;
 
                 char **strv = STRV_MAKE("SIXTH=ijn", "SEVENTH=PRP");
-                ASSERT_NOT_NULL(ctx = log_context_new_strv(strv, /*owned=*/ false));
+                ASSERT_NOT_NULL(ctx = log_context_new_strv(strv, /* owned= */ false));
 
                 ASSERT_EQ(log_context_num_contexts(), 1U);
                 ASSERT_EQ(log_context_num_fields(), 2U);
@@ -261,13 +261,12 @@ static void test_log_context(void) {
                         IOVEC_MAKE_STRING("ABC=def"),
                         IOVEC_MAKE_STRING("GHI=jkl"),
                 };
-                _cleanup_free_ struct iovec_wrapper *iovw = NULL;
-                ASSERT_NOT_NULL(iovw = iovw_new());
-                ASSERT_OK(iovw_consume(iovw, strdup("MNO=pqr"), STRLEN("MNO=pqr") + 1));
+                struct iovec_wrapper iovw = {};
+                ASSERT_OK(iovw_consume(&iovw, strdup("MNO=pqr"), STRLEN("MNO=pqr") + 1));
 
                 LOG_CONTEXT_PUSH_IOV(iov, ELEMENTSOF(iov));
                 LOG_CONTEXT_PUSH_IOV(iov, ELEMENTSOF(iov));
-                LOG_CONTEXT_CONSUME_IOV(iovw->iovec, iovw->count);
+                LOG_CONTEXT_CONSUME_IOV(iovw.iovec, iovw.count);
                 LOG_CONTEXT_PUSH("STU=vwx");
 
                 ASSERT_EQ(log_context_num_contexts(), 3U);

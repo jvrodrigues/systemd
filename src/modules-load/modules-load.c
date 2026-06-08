@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -12,13 +11,16 @@
 #include "build.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "cpu-set-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "format-table.h"
 #include "log.h"
 #include "macro.h"
 #include "main-func.h"
 #include "module-util.h"
+#include "options.h"
 #include "ordered-set.h"
 #include "parse-util.h"
 #include "pretty-print.h"
@@ -79,7 +81,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                r = strv_split_and_extend(&arg_proc_cmdline_modules, value, ",", /* filter_duplicates = */ true);
+                r = strv_split_and_extend(&arg_proc_cmdline_modules, value, ",", /* filter_duplicates= */ true);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse modules_load= kernel command line option: %m");
         }
@@ -151,7 +153,7 @@ static int do_direct_probe(OrderedSet *module_set) {
                 return log_error_errno(r, "Failed to initialize libkmod context: %m");
 
         ORDERED_SET_FOREACH(module, module_set) {
-                r = module_load_and_warn(ctx, module, /* verbose = */ true);
+                r = module_load_and_warn(ctx, module, /* verbose= */ true);
                 if (r != -ENOENT)
                         RET_GATHER(ret, r);
         }
@@ -165,7 +167,7 @@ static int enqueue_module_to_load(int sock, const char *module) {
         assert(sock >= 0);
         assert(module);
 
-        bytes = send(sock, module, strlen(module), /* flags = */ 0);
+        bytes = send(sock, module, strlen(module), /* flags= */ 0);
         if (bytes < 0)
                 return log_error_errno(errno, "Failed to send '%s' to thread pool: %m", module);
 
@@ -180,7 +182,7 @@ static int dequeue_module_to_load(int sock, char *buffer, size_t buffer_len) {
 
         /* Dequeue one module to be loaded from the socket pair. In case no more
          * modules are present, recv() will return 0. */
-        bytes = recv(sock, buffer, buffer_len, /* flags = */ 0);
+        bytes = recv(sock, buffer, buffer_len, /* flags= */ 0);
         if (bytes == 0)
                 return 0;
         if (bytes < 0)
@@ -217,7 +219,7 @@ static int run_prober(int sock) {
                         break;
                 }
 
-                r = module_load_and_warn(ctx, buffer, /* verbose = */ true);
+                r = module_load_and_warn(ctx, buffer, /* verbose= */ true);
                 if (r != -ENOENT)
                         RET_GATHER(ret, r);
         }
@@ -257,7 +259,7 @@ static int create_worker_threads(size_t n_threads, void *arg, pthread_t **ret_th
                 return log_error_errno(r, "Failed to mask signals for workers: %m");
 
         for (created_threads = 0; created_threads < n_threads; ++created_threads) {
-                r = pthread_create(&new_threads[created_threads], /* attr = */ NULL, prober_thread, arg);
+                r = pthread_create(&new_threads[created_threads], /* attr= */ NULL, prober_thread, arg);
                 if (r != 0) {
                         log_error_errno(r, "Failed to create worker thread %zu: %m", created_threads);
                         break;
@@ -313,13 +315,13 @@ static unsigned determine_num_worker_threads(unsigned n_modules) {
         if (n_threads == UINT_MAX) {
                 /* By default, use a number of worker threads equal the number of online CPUs,
                  * but clamp it to avoid a probing storm on machines with many CPUs. */
-                long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-                if (ncpus < 0) {
-                        log_warning_errno(errno, "Failed to get number of online CPUs, ignoring: %m");
-                        ncpus = 1;
-                }
-
-                n_threads = CLAMP((unsigned)ncpus, 1U, 16U);
+                unsigned n_cpus;
+                r = cpus_online(&n_cpus);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to get number of online CPUs, ignoring: %m");
+                        n_threads = 1;
+                } else
+                        n_threads = CLAMP(n_cpus, 1U, 16U);
         }
 
         /* There's no reason to spawn more threads than the modules that need to be loaded */
@@ -331,53 +333,46 @@ static unsigned determine_num_worker_threads(unsigned n_modules) {
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
+        _cleanup_(table_unrefp) Table *options = NULL;
+        int r;
 
         if (terminal_urlify_man("systemd-modules-load.service", "8", &link) < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
-               "Loads statically configured kernel modules.\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
+        r = option_parser_get_help_table(&options);
+        if (r < 0)
+                return r;
 
+        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
+               "Loads statically configured kernel modules.\n\n",
+               program_invocation_short_name);
+
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
+
+        printf("\nSee the %s for details.\n", link);
         return 0;
 }
 
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                {}
-        };
-
-        int c;
-
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(ret_args);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
+                OPTION_COMMON_HELP:
                         return help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -395,7 +390,8 @@ static int run(int argc, char *argv[]) {
         char *module;
         int ret = 0, r;
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -403,13 +399,13 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata = */ NULL, PROC_CMDLINE_STRIP_RD_PREFIX);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, PROC_CMDLINE_STRIP_RD_PREFIX);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
-        if (argc > optind) {
-                for (int i = optind; i < argc; i++) {
-                        r = apply_file_from_path(argv[i], &module_set);
+        if (!strv_isempty(args)) {
+                STRV_FOREACH(i, args) {
+                        r = apply_file_from_path(*i, &module_set);
                         if (r < 0)
                                 RET_GATHER(ret, r);
                 }
@@ -417,13 +413,13 @@ static int run(int argc, char *argv[]) {
                 ConfFile **files = NULL;
                 size_t n_files = 0;
 
-                CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+                CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
                 STRV_FOREACH(i, arg_proc_cmdline_modules)
                         RET_GATHER(ret, modules_list_append_dup(&module_set, *i));
 
-                r = conf_files_list_nulstr_full(".conf", /* root = */ NULL,
-                                                CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED,
+                r = conf_files_list_nulstr_full(".conf", /* root= */ NULL,
+                                                CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED | CONF_FILES_WARN,
                                                 conf_file_dirs, &files, &n_files);
                 if (r < 0)
                         RET_GATHER(ret, log_error_errno(r, "Failed to enumerate modules-load.d files: %m"));
@@ -442,7 +438,7 @@ static int run(int argc, char *argv[]) {
         }
 
         /* Create a socketpair for communication with probe workers */
-        r = RET_NERRNO(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, /* protocol = */ 0, pair));
+        r = RET_NERRNO(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, /* protocol= */ 0, pair));
         if (r < 0)
                 return log_error_errno(r, "Failed to create socket pair: %m");
 

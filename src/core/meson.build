@@ -1,12 +1,36 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+systemd_sources = files(
+        'apparmor-setup.c',
+        'clock-warp.c',
+        'crash-handler.c',
+        'efi-random.c',
+        'ima-setup.c',
+        'import-creds.c',
+        'ipe-setup.c',
+        'kmod-setup.c',
+        'main.c',
+        'smack-setup.c',
+)
+
+if conf.get('HAVE_SELINUX') == 1
+        systemd_sources += files('selinux-setup.c')
+endif
+
+systemd_executor_sources = files(
+        'executor.c',
+        'exec-invoke.c',
+)
+
 libcore_sources = files(
         'audit-fd.c',
         'automount.c',
+        'bpf-bind-iface.c',
         'bpf-devices.c',
         'bpf-firewall.c',
         'bpf-foreign.c',
         'bpf-restrict-fs.c',
+        'bpf-restrict-fsaccess.c',
         'bpf-restrict-ifaces.c',
         'bpf-socket-bind.c',
         'cgroup.c',
@@ -36,11 +60,11 @@ libcore_sources = files(
         'execute.c',
         'execute-serialize.c',
         'generator-setup.c',
-        'import-creds.c',
         'job.c',
         'kill.c',
         'load-dropin.c',
         'load-fragment.c',
+        'luo.c',
         'manager-dump.c',
         'manager-serialize.c',
         'manager.c',
@@ -63,23 +87,33 @@ libcore_sources = files(
         'unit-serialize.c',
         'unit.c',
         'varlink.c',
+        'varlink-automount.c',
         'varlink-cgroup.c',
         'varlink-common.c',
         'varlink-dynamic-user.c',
         'varlink-execute.c',
+        'varlink-job.c',
+        'varlink-kill.c',
         'varlink-manager.c',
+        'varlink-metrics.c',
+        'varlink-mount.c',
+        'varlink-path.c',
+        'varlink-scope.c',
+        'varlink-service.c',
+        'varlink-socket.c',
+        'varlink-swap.c',
+        'varlink-timer.c',
         'varlink-unit.c',
 )
 
-subdir('bpf/socket-bind')
-subdir('bpf/restrict-fs')
-subdir('bpf/restrict-ifaces')
-
 if conf.get('BPF_FRAMEWORK') == 1
-        libcore_sources += [
-                socket_bind_skel_h,
-                restrict_fs_skel_h,
-                restrict_ifaces_skel_h]
+        foreach name : ['socket-bind', 'restrict-fs', 'restrict-ifaces', 'bind-iface']
+                libcore_sources += bpf_programs_by_name[name]
+        endforeach
+endif
+
+if conf.get('HAVE_LSM_INTEGRITY_TYPE') == 1
+        libcore_sources += bpf_programs_by_name['restrict-fsaccess']
 endif
 
 sources += libcore_sources
@@ -125,23 +159,21 @@ generated_sources += [load_fragment_gperf_c, load_fragment_gperf_nulstr_c, bpf_d
 libcore_sources += [load_fragment_gperf_c, load_fragment_gperf_nulstr_c, bpf_delegate_configs_inc]
 libcore_build_dir = meson.current_build_dir()
 libcore_name = 'systemd-core-@0@'.format(shared_lib_tag)
+core_includes = [include_directories('.'), includes]
 
 libcore_static = static_library(
         libcore_name,
         libcore_sources,
-        include_directories : [includes, include_directories('.')],
+        include_directories : core_includes,
         implicit_include_directories : false,
         c_args : ['-fvisibility=default'],
         dependencies : [libaudit_cflags,
                         libbpf_cflags,
                         libcryptsetup_cflags,
-                        libdl,
                         libm,
                         libmount_cflags,
-                        librt,
                         libseccomp_cflags,
                         libselinux_cflags,
-                        threads,
                         userspace],
         build_by_default : false)
 
@@ -156,26 +188,6 @@ libcore = shared_library(
         link_with : libshared,
         install : true,
         install_dir : pkglibdir)
-
-core_includes = [includes, include_directories('.')]
-
-systemd_sources = files(
-        'main.c',
-        'crash-handler.c',
-        'clock-warp.c',
-        'kmod-setup.c',
-        'apparmor-setup.c',
-        'ima-setup.c',
-        'ipe-setup.c',
-        'selinux-setup.c',
-        'smack-setup.c',
-        'efi-random.c',
-)
-
-systemd_executor_sources = files(
-        'executor.c',
-        'exec-invoke.c',
-)
 
 executor_libs = get_option('link-executor-shared') ? \
         [
@@ -202,6 +214,7 @@ executables += [
                 'dependencies' : [
                         libapparmor_cflags,
                         libkmod_cflags,
+                        libmount_cflags,
                         libseccomp_cflags,
                         libselinux_cflags,
                 ],
@@ -210,7 +223,6 @@ executables += [
                 'name' : 'systemd-executor',
                 'public' : true,
                 'sources' : systemd_executor_sources,
-                'include_directories' : core_includes,
                 'link_with' : executor_libs,
                 'dependencies' : [
                         libapparmor_cflags,

@@ -198,9 +198,14 @@ def get_zboot_kernel(f: IO[bytes]) -> bytes:
     elif comp_type.startswith(b'xzkern'):
         raise NotImplementedError('xzkern decompression not implemented')
     elif comp_type.startswith(b'zstd'):
-        zstd = try_import('zstandard')
-        data = f.read(size)
-        return cast(bytes, zstd.ZstdDecompressor().stream_reader(data).read())
+        try:
+            zstd = try_import('compression.zstd')
+            data = f.read(size)
+            return cast(bytes, zstd.zstd.ZstdDecompressor().decompress(data))
+        except ValueError:
+            zstd = try_import('zstandard')
+            data = f.read(size)
+            return cast(bytes, zstd.ZstdDecompressor().stream_reader(data).read())
 
     raise NotImplementedError(f'unknown compressed type: {comp_type!r}')
 
@@ -230,8 +235,12 @@ def maybe_decompress(filename: Union[str, Path]) -> bytes:
         return cast(bytes, gzip.open(f).read())
 
     if start.startswith(b'\x28\xb5\x2f\xfd'):
-        zstd = try_import('zstandard')
-        return cast(bytes, zstd.ZstdDecompressor().stream_reader(f.read()).read())
+        try:
+            zstd = try_import('compression.zstd')
+            return cast(bytes, zstd.zstd.ZstdDecompressor().decompress(f.read()))
+        except ValueError:
+            zstd = try_import('zstandard')
+            return cast(bytes, zstd.ZstdDecompressor().stream_reader(f.read()).read())
 
     if start.startswith(b'\x02\x21\x4c\x18'):
         lz4 = try_import('lz4.frame', 'lz4')
@@ -264,7 +273,7 @@ class UkifyConfig:
     devicetree: Path
     devicetree_auto: list[Path]
     efi_arch: str
-    hwids: Path
+    hwids: Union[str, Path, None]
     initrd: list[Path]
     efifw: list[Path]
     join_profiles: list[Path]
@@ -590,7 +599,7 @@ class SystemdSbSign(SignTool):
         )
         cmd = [
             tool,
-            "sign",
+            'sign',
             '--private-key', opts.sb_key,
             '--certificate', opts.sb_cert,
             *(
@@ -1100,7 +1109,7 @@ def pe_add_sections(opts: UkifyConfig, uki: UKI, output: str) -> None:
                 encoded = json.dumps(j).encode()
                 if len(encoded) > section.SizeOfRawData:
                     raise PEError(
-                        f'Not enough space in existing section .pcrsig of size {section.SizeOfRawData} to append new data of size {len(encoded)}'  # noqa: E501
+                        f'Not enough space in existing section .pcrsig of size {section.SizeOfRawData} to append new data of size {len(encoded)}'
                     )
                 section.Misc_VirtualSize = len(encoded)
                 # bytes(n) results in an array of n zeroes
@@ -1296,15 +1305,15 @@ def parse_efifw_dir(path: Path) -> bytes:
     return efifw_blob
 
 
-STUB_SBAT = """\
+STUB_SBAT = '''\
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
 uki,1,UKI,uki,1,https://uapi-group.org/specifications/specs/unified_kernel_image/
-"""
+'''
 
-ADDON_SBAT = """\
+ADDON_SBAT = '''\
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
 uki-addon,1,UKI Addon,addon,1,https://www.freedesktop.org/software/systemd/man/latest/systemd-stub.html
-"""
+'''
 
 
 def make_uki(opts: UkifyConfig) -> None:
@@ -1355,7 +1364,7 @@ def make_uki(opts: UkifyConfig) -> None:
     pcrpkey: Union[bytes, Path, None] = opts.pcrpkey
     if pcrpkey is None:
         keyutil_tool = find_tool('systemd-keyutil', '/usr/lib/systemd/systemd-keyutil')
-        cmd = [keyutil_tool, 'public']
+        cmd = [keyutil_tool, 'extract-public']
 
         if opts.pcr_public_keys and len(opts.pcr_public_keys) == 1:
             # If we're using an engine or provider, the public key will be an X.509 certificate.
@@ -1388,8 +1397,14 @@ def make_uki(opts: UkifyConfig) -> None:
 
     hwids = None
 
-    if opts.hwids is not None:
-        hwids = parse_hwid_dir(opts.hwids)
+    if opts.hwids != '':
+        if opts.hwids is not None:
+            hwids = parse_hwid_dir(Path(opts.hwids))
+        else:
+            hwids_dir = Path(f'/usr/lib/systemd/boot/hwids/{opts.efi_arch}')
+            if hwids_dir.is_dir():
+                print(f'Automatically building .hwids section from {hwids_dir}', file=sys.stderr)
+                hwids = parse_hwid_dir(hwids_dir)
 
     sections = [
         # name,      content,         measure?
@@ -1468,6 +1483,9 @@ def make_uki(opts: UkifyConfig) -> None:
         '.profile',
     }
 
+    if not opts.os_release:
+        to_import.remove('.osrel')
+
     for profile in opts.join_profiles:
         pe = pefile.PE(profile, fast_load=True)
         prev_len = len(uki.sections)
@@ -1480,7 +1498,7 @@ def make_uki(opts: UkifyConfig) -> None:
 
         if names[0] != '.profile':
             raise ValueError(
-                f'Expected .profile section as first valid section in PE profile binary {profile} but got {names[0]}'  # noqa: E501
+                f'Expected .profile section as first valid section in PE profile binary {profile} but got {names[0]}'
             )
 
         if names.count('.profile') > 1:
@@ -1670,7 +1688,7 @@ def generate_keys(opts: UkifyConfig) -> None:
 
     if not work:
         raise ValueError(
-            'genkey: --secureboot-private-key=/--secureboot-certificate= or --pcr-private-key/--pcr-public-key must be specified'  # noqa: E501
+            'genkey: --secureboot-private-key=/--secureboot-certificate= or --pcr-private-key/--pcr-public-key must be specified'
         )
 
 
@@ -1841,6 +1859,17 @@ class ConfigItem:
         args = self._names()
         parser.add_argument(*args, **kwargs)
 
+    def parse_value(self, s: str) -> Any:
+        if self.action == argparse.BooleanOptionalAction:
+            # We need to handle this case separately: the options are called
+            # --foo and --no-foo, and no argument is parsed. But in the config
+            # file, we have Foo=yes or Foo=no.
+            return self.parse_boolean(s)
+        elif self.type:
+            return self.type(s)
+
+        return s
+
     def apply_config(
         self,
         namespace: argparse.Namespace,
@@ -1852,24 +1881,13 @@ class ConfigItem:
         assert f'{section}/{key}' == self.config_key
         dest = self.argparse_dest()
 
-        conv: Callable[[str], Any]
-        if self.action == argparse.BooleanOptionalAction:
-            # We need to handle this case separately: the options are called
-            # --foo and --no-foo, and no argument is parsed. But in the config
-            # file, we have Foo=yes or Foo=no.
-            conv = self.parse_boolean
-        elif self.type:
-            conv = self.type
-        else:
-            conv = lambda s: s  # noqa: E731
-
         # This is a bit ugly, but --initrd and --devicetree-auto are the only options
         # with multiple args on the command line and a space-separated list in the
         # config file.
         if self.name in ['--initrd', '--devicetree-auto']:
-            value = [conv(v) for v in value.split()]
+            value = [self.parse_value(v) for v in value.split()]
         else:
-            value = conv(value)
+            value = self.parse_value(value)
 
         self.config_push(namespace, group, dest, value)
 
@@ -1982,7 +2000,6 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--hwids',
         metavar='DIR',
-        type=Path,
         help='Directory with HWID text files [.hwids section]',
         config_key='UKI/HWIDs',
     ),
@@ -2099,14 +2116,14 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--secureboot-private-key',
         dest='sb_key',
-        help='required by --signtool=sbsign|systemd-sbsign. Path to key file or engine/provider designation for SB signing',  # noqa: E501
+        help='required by --signtool=sbsign|systemd-sbsign. Path to key file or engine/provider designation for SB signing',
         config_key='UKI/SecureBootPrivateKey',
     ),
     ConfigItem(
         '--secureboot-certificate',
         dest='sb_cert',
         help=(
-            'required by --signtool=sbsign. sbsign needs a path to certificate file or engine-specific designation for SB signing'  # noqa: E501
+            'required by --signtool=sbsign. sbsign needs a path to certificate file or engine-specific designation for SB signing'
         ),
         config_key='UKI/SecureBootCertificate',
     ),
@@ -2115,7 +2132,7 @@ CONFIG_ITEMS = [
         dest='sb_certdir',
         default='/etc/pki/pesign',
         help=(
-            'required by --signtool=pesign. Path to nss certificate database directory for PE signing. Default is /etc/pki/pesign'  # noqa: E501
+            'required by --signtool=pesign. Path to nss certificate database directory for PE signing. Default is /etc/pki/pesign'
         ),
         config_key='UKI/SecureBootCertificateDir',
         config_push=ConfigItem.config_set,
@@ -2124,7 +2141,7 @@ CONFIG_ITEMS = [
         '--secureboot-certificate-name',
         dest='sb_cert_name',
         help=(
-            'required by --signtool=pesign. pesign needs a certificate nickname of nss certificate database entry to use for PE signing'  # noqa: E501
+            'required by --signtool=pesign. pesign needs a certificate nickname of nss certificate database entry to use for PE signing'
         ),
         config_key='UKI/SecureBootCertificateName',
     ),
@@ -2309,11 +2326,11 @@ def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description='Build and sign Unified Kernel Images',
         usage='\n  '
-        + textwrap.dedent("""\
+        + textwrap.dedent('''\
           ukify {b}build{e} [--linux=LINUX] [--initrd=INITRD] [options…]
             ukify {b}genkey{e} [options…]
             ukify {b}inspect{e} FILE… [options…]
-        """).format(b=Style.bold, e=Style.reset),
+        ''').format(b=Style.bold, e=Style.reset),
         allow_abbrev=False,
         add_help=False,
         epilog='\n  '.join(('config file:', *config_example())),
@@ -2403,7 +2420,12 @@ def finalize_options(opts: argparse.Namespace) -> None:
 
     opts.os_release = resolve_at_path(opts.os_release)
 
-    if not opts.os_release and opts.linux:
+    if opts.os_release == '':
+        # If --os-release= with an empty string was passed, treat that as
+        # explicitly disabling the .osrel section, and do not fallback to the
+        # system's os-release files.
+        pass
+    elif opts.os_release is None and opts.linux:
         p = Path('/etc/os-release')
         if not p.exists():
             p = Path('/usr/lib/os-release')
@@ -2436,7 +2458,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
         # both param given, infer sbsign and in case it was given, ensure signtool=sbsign
         if opts.signtool and opts.signtool not in ('sbsign', 'systemd-sbsign'):
             raise ValueError(
-                f'Cannot provide --signtool={opts.signtool} with --secureboot-private-key= and --secureboot-certificate='  # noqa: E501
+                f'Cannot provide --signtool={opts.signtool} with --secureboot-private-key= and --secureboot-certificate='
             )
         if not opts.signtool:
             opts.signtool = 'sbsign'
@@ -2456,7 +2478,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
 
     if opts.sign_kernel and not opts.sb_key and not opts.sb_cert_name:
         raise ValueError(
-            '--sign-kernel requires either --secureboot-private-key= and --secureboot-certificate= (for sbsign) or --secureboot-certificate-name= (for pesign) to be specified'  # noqa: E501
+            '--sign-kernel requires either --secureboot-private-key= and --secureboot-certificate= (for sbsign) or --secureboot-certificate-name= (for pesign) to be specified'
         )
 
     opts.profile = resolve_at_path(opts.profile)

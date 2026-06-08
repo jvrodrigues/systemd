@@ -10,7 +10,7 @@
 #include "capability-util.h"
 #include "daemon-util.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "networkd-conf.h"
 #include "networkd-manager.h"
 #include "networkd-manager-bus.h"
@@ -42,13 +42,12 @@ static int run(int argc, char *argv[]) {
         /* Drop privileges, but only if we have been started as root. If we are not running as root we assume all
          * privileges are already dropped and we can't create our runtime directory. */
         if (geteuid() == 0) {
-                const char *user = "systemd-network";
                 uid_t uid;
                 gid_t gid;
 
-                r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
+                r = get_user_creds("systemd-network", /* flags= */ 0, NULL, &uid, &gid, NULL, NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Cannot resolve user name %s: %m", user);
+                        return log_error_errno(r, "Cannot resolve user name %s: %m", "systemd-network");
 
                 /* Create runtime directory. This is not necessary when networkd is
                  * started with "RuntimeDirectory=systemd/netif", or after
@@ -79,7 +78,7 @@ static int run(int argc, char *argv[]) {
                         log_warning_errno(r, "Could not create directory '%s': %m", p);
         }
 
-        r = manager_new(&m, /* test_mode = */ false);
+        r = manager_new(&m, /* test_mode= */ false);
         if (r < 0)
                 return log_error_errno(r, "Could not create manager: %m");
 

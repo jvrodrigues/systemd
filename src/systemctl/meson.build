@@ -36,7 +36,6 @@ systemctl_extract_sources = files(
         'systemctl-daemon-reload.c',
         'systemctl-logind.c',
         'systemctl-start-unit.c',
-        'systemctl-sysv-compat.c',
         'systemctl-util.c',
         'systemctl.c',
 )
@@ -59,7 +58,6 @@ executables += [
                         liblz4_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
                 'install_tag' : 'systemctl',
         },
